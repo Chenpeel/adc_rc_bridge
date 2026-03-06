@@ -1,0 +1,76 @@
+# =========================
+# ESP-IDF / CMake 构建产物
+# =========================
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+install_manifest.txt
+*.ninja
+.ninja_*
+rules.ninja
+
+# =========================
+# ESP-IDF 生成文件
+# =========================
+flasher_args.json
+flasher_args.json.in
+flash_args
+flash_args.in
+flash_*_args
+app-flash_args
+app-flash_args.in
+bootloader-flash_args
+partition-table-flash_args
+project_description.json
+project_elf_src_*.c
+x509_crt_bundle.S
+*.bin
+*.elf
+*.map
+
+# =========================
+# SDK 配置（保留默认模板）
+# =========================
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+sdkconfig.*.old
+sdkconfig.*.bak
+!sdkconfig.defaults
+
+# =========================
+# 组件管理与缓存
+# =========================
+managed_components/
+.cm_cache/
+.component_hash
+component_requires.temp.cmake
+
+# =========================
+# Python 缓存（idf.py 相关）
+# =========================
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# =========================
+# 日志与临时文件
+# =========================
+*.log
+*.tmp
+*.temp
+
+# =========================
+# 编辑器 / 系统文件
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
