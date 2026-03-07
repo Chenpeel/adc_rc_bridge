@@ -26,7 +26,40 @@
 
 static const char* TAG = "app";
 static const char* TARGET_NAME = "esp32";
-static const uint32_t SEND_INTERVAL_MS = 50; // 20Hz
+static const uint32_t SEND_INTERVAL_MS = 30; // ~33Hz, 更低控制延迟
+static const uint32_t WAIT_BIND_LOG_INTERVAL_MS = 3000; // 未绑定目标时日志限频
+static const uint32_t WAIT_WS_LOG_INTERVAL_MS = 3000; // WebSocket未连接时日志限频
+static const uint32_t NO_CHANGE_LOG_INTERVAL_MS = 5000; // 无变化时日志限频
+static const uint32_t SEND_THROTTLE_LOG_INTERVAL_MS = 3000; // 发送限流日志间隔
+static const float SERVO_FILTER_ALPHA = 0.22f; // EMA低通滤波系数(0~1, 越大越跟手)
+static const int SERVO_DEADZONE = 5; // 舵机死区(角度单位), 约5度抖动过滤
+static const int SERVO_MAX_STEP_PER_TICK = 6; // 每个发送周期允许的最大角度变化
+static const int SERVO_SEND_MIN_DELTA = 2; // 与上次发送相比最小变化量，小于该值不发
+static const bool ENABLE_SERVO_JUMP_FILTER = false; // 巨跳变过滤开关
+static const int SERVO_JUMP_REJECT_THRESHOLD = 14; // 判定为异常跳变的阈值(需大于死区)
+static const int SERVO_JUMP_CONFIRM_FRAMES = 6; // 大跳变需要连续确认帧数
+static const bool ENABLE_SERVER_CONTROL_MIRROR = false; // 是否同时发送server-c镜像格式
+static const int SERVO_SEND_BATCH_MAX = 8; // 每次最多发送的舵机条数，避免单包过大
+static const int SERVO_MAX_BATCH_PER_TICK = 1; // 每周期最多发送批次数，避免短时打爆socket
+static const int WS_RECONNECT_TIMEOUT_MS = 2000;
+static const int WS_NETWORK_TIMEOUT_MS = 15000;
+static const int WS_PINGPONG_TIMEOUT_SEC = 60;
+static const bool WS_DISABLE_PINGPONG_DISCON = true;
+static const bool WS_TCP_KEEPALIVE_ENABLE = true;
+static const int WS_TCP_KEEPALIVE_IDLE_SEC = 20;
+static const int WS_TCP_KEEPALIVE_INTERVAL_SEC = 5;
+static const int WS_TCP_KEEPALIVE_COUNT = 3;
+static const int SERVO_ID_MIN = 21;
+static const int SERVO_ID_MAX = 43;
+static const int SERVO_ID_COUNT = SERVO_ID_MAX - SERVO_ID_MIN + 1; // 23路(21~43)
+static_assert(SERVO_ID_COUNT > 0, "SERVO_ID_COUNT must be positive");
+static_assert(SERVO_ID_COUNT <= SEND_CHANNELS, "SERVO_ID_COUNT must not exceed ADC channels");
+static_assert(SERVO_MAX_STEP_PER_TICK > 0, "SERVO_MAX_STEP_PER_TICK must be positive");
+static_assert(SERVO_SEND_MIN_DELTA >= 1, "SERVO_SEND_MIN_DELTA must be >= 1");
+static_assert(SERVO_JUMP_REJECT_THRESHOLD > SERVO_DEADZONE, "jump reject threshold should exceed deadzone");
+static_assert(SERVO_JUMP_CONFIRM_FRAMES > 0, "jump confirm frames must be positive");
+static_assert(SERVO_SEND_BATCH_MAX > 0, "SERVO_SEND_BATCH_MAX must be positive");
+static_assert(SERVO_MAX_BATCH_PER_TICK > 0, "SERVO_MAX_BATCH_PER_TICK must be positive");
 
 static const char* DEFAULT_SSID = "gaoda";
 static const char* DEFAULT_PASS = "gaoda123";
@@ -49,6 +82,117 @@ char ws_target_id[64] = {0};
 
 static httpd_handle_t s_httpd = NULL;
 static bool s_ap_netif_created = false;
+
+static inline bool is_ws_connected() {
+  return (ws_client != NULL) && esp_websocket_client_is_connected(ws_client);
+}
+
+struct ServoOutputFilter {
+  float filtered[SERVO_ID_COUNT] = {0.0f};
+  int stable[SERVO_ID_COUNT] = {0};
+  bool inited[SERVO_ID_COUNT] = {false};
+  int pending_dir[SERVO_ID_COUNT] = {0};
+  uint8_t pending_count[SERVO_ID_COUNT] = {0};
+
+  bool confirm_large_delta(int idx, int delta) {
+    int dir = (delta > 0) ? 1 : -1;
+    if (pending_dir[idx] == dir) {
+      if (pending_count[idx] < 0xFF) pending_count[idx]++;
+    } else {
+      pending_dir[idx] = dir;
+      pending_count[idx] = 1;
+    }
+
+    if (pending_count[idx] < SERVO_JUMP_CONFIRM_FRAMES) {
+      return false;
+    }
+
+    pending_dir[idx] = 0;
+    pending_count[idx] = 0;
+    return true;
+  }
+
+  int apply(int idx, float raw_angle) {
+    if (!inited[idx]) {
+      filtered[idx] = raw_angle;
+      stable[idx] = clampi((int)(raw_angle + 0.5f), 0, 360);
+      inited[idx] = true;
+      pending_dir[idx] = 0;
+      pending_count[idx] = 0;
+      return stable[idx];
+    }
+
+    filtered[idx] += SERVO_FILTER_ALPHA * (raw_angle - filtered[idx]);
+    int candidate = clampi((int)(filtered[idx] + 0.5f), 0, 360);
+    int delta = candidate - stable[idx];
+    int abs_delta = abs(delta);
+    if (abs_delta <= SERVO_DEADZONE) {
+      pending_dir[idx] = 0;
+      pending_count[idx] = 0;
+      return stable[idx];
+    }
+
+    if (ENABLE_SERVO_JUMP_FILTER) {
+      // 大跳变需要连续多帧同向确认，抑制瞬时毛刺
+      if (abs_delta >= SERVO_JUMP_REJECT_THRESHOLD && !confirm_large_delta(idx, delta)) {
+        return stable[idx];
+      }
+      if (abs_delta < SERVO_JUMP_REJECT_THRESHOLD) {
+        pending_dir[idx] = 0;
+        pending_count[idx] = 0;
+      }
+    } else {
+      pending_dir[idx] = 0;
+      pending_count[idx] = 0;
+    }
+
+    if (delta > SERVO_MAX_STEP_PER_TICK) {
+      delta = SERVO_MAX_STEP_PER_TICK;
+    } else if (delta < -SERVO_MAX_STEP_PER_TICK) {
+      delta = -SERVO_MAX_STEP_PER_TICK;
+    }
+    stable[idx] = clampi(stable[idx] + delta, 0, 360);
+    return stable[idx];
+  }
+};
+
+static void build_servo_params(std::pair<int, int>* servo_params, ServoOutputFilter* filter) {
+  if (!servo_params || !filter) return;
+  for (int idx = 0; idx < SERVO_ID_COUNT; idx++) {
+    int out_angle = filter->apply(idx, readChannel(idx));
+    servo_params[idx] = {SERVO_ID_MIN + idx, out_angle};
+  }
+}
+
+static size_t collect_servo_deltas(const std::pair<int, int>* current_params,
+                                   const int* last_sent_angles,
+                                   const bool* last_sent_valid,
+                                   bool force_full_sync,
+                                   std::pair<int, int>* delta_params) {
+  if (!current_params || !last_sent_angles || !last_sent_valid || !delta_params) return 0;
+  size_t count = 0;
+  for (int idx = 0; idx < SERVO_ID_COUNT; idx++) {
+    int angle = current_params[idx].second;
+    int delta = abs(angle - last_sent_angles[idx]);
+    if (force_full_sync || !last_sent_valid[idx] || delta >= SERVO_SEND_MIN_DELTA) {
+      delta_params[count++] = current_params[idx];
+    }
+  }
+  return count;
+}
+
+static void update_last_sent_state(const std::pair<int, int>* sent_items,
+                                   size_t count,
+                                   int* last_sent_angles,
+                                   bool* last_sent_valid) {
+  if (!sent_items || !last_sent_angles || !last_sent_valid) return;
+  for (size_t i = 0; i < count; i++) {
+    int idx = sent_items[i].first - SERVO_ID_MIN;
+    if (idx < 0 || idx >= SERVO_ID_COUNT) continue;
+    last_sent_angles[idx] = sent_items[i].second;
+    last_sent_valid[idx] = true;
+  }
+}
 
 static const char html_form[] =
   "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>ESP32 配网</title></head>"
@@ -265,6 +409,7 @@ static void start_ap_mode() {
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     if (s_retry_num < 20) {
       esp_wifi_connect();
       s_retry_num++;
@@ -276,6 +421,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
     ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
     ESP_LOGI(TAG, "WiFi 连接成功, IP: " IPSTR, IP2STR(&event->ip_info.ip));
     s_retry_num = 0;
+    xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
   }
 }
@@ -302,6 +448,7 @@ static void wifi_init_sta(const char* ssid, const char* pass) {
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
   ESP_ERROR_CHECK(esp_wifi_start());
+  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE)); // 关闭省电，降低链路抖动断连概率
 
   scan_networks();
   ESP_LOGI(TAG, "正在连接 WiFi (%s)...", ssid);
@@ -337,6 +484,8 @@ static void handle_servo_control(cJSON* obj) {
 
 static void try_pick_target_id_from_list(cJSON* arr) {
   if (!cJSON_IsArray(arr)) return;
+
+  // 1) 优先按配置名精确匹配
   cJSON* item = NULL;
   cJSON_ArrayForEach(item, arr) {
     cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
@@ -352,7 +501,32 @@ static void try_pick_target_id_from_list(cJSON* arr) {
       return;
     }
   }
-  ESP_LOGW(TAG, "在线列表里没有名为 %s 的设备", TARGET_NAME);
+
+  // 2) 找不到配置名时，兜底绑定首个非本机在线设备
+  const char* fallback_name = NULL;
+  const char* fallback_id = NULL;
+  cJSON_ArrayForEach(item, arr) {
+    cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
+    cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
+    const char* name_str = cJSON_IsString(name) ? name->valuestring : "";
+    const char* id_str = cJSON_IsString(id) ? id->valuestring : "";
+    if (!id_str || !*id_str) continue;
+    if (strcmp(name_str, g_board_name) == 0) continue;
+
+    fallback_name = name_str;
+    fallback_id = id_str;
+    break;
+  }
+
+  if (fallback_id && *fallback_id) {
+    if (strcmp(ws_target_id, fallback_id) != 0) {
+      safe_strcpy(ws_target_id, sizeof(ws_target_id), fallback_id);
+      ESP_LOGW(TAG, "未找到目标名 %s, 回退绑定 %s, id=%s", TARGET_NAME, fallback_name ? fallback_name : "", ws_target_id);
+    }
+    return;
+  }
+
+  ESP_LOGW(TAG, "在线列表里没有可绑定目标(目标名=%s, 本机名=%s)", TARGET_NAME, g_board_name);
 }
 
 static void handle_message(const char* message) {
@@ -478,6 +652,14 @@ static void start_websocket() {
   ws_cfg.uri = "ws://192.168.0.100:9102/";
   ws_cfg.buffer_size = 2048;
   ws_cfg.disable_auto_reconnect = false;
+  ws_cfg.reconnect_timeout_ms = WS_RECONNECT_TIMEOUT_MS;
+  ws_cfg.network_timeout_ms = WS_NETWORK_TIMEOUT_MS;
+  ws_cfg.pingpong_timeout_sec = WS_PINGPONG_TIMEOUT_SEC;
+  ws_cfg.disable_pingpong_discon = WS_DISABLE_PINGPONG_DISCON;
+  ws_cfg.keep_alive_enable = WS_TCP_KEEPALIVE_ENABLE;
+  ws_cfg.keep_alive_idle = WS_TCP_KEEPALIVE_IDLE_SEC;
+  ws_cfg.keep_alive_interval = WS_TCP_KEEPALIVE_INTERVAL_SEC;
+  ws_cfg.keep_alive_count = WS_TCP_KEEPALIVE_COUNT;
   ws_client = esp_websocket_client_init(&ws_cfg);
   esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
   esp_websocket_client_start(ws_client);
@@ -486,30 +668,91 @@ static void start_websocket() {
 static void app_task(void* arg) {
   uint32_t last_send_ms = 0;
   uint32_t last_heartbeat_ms = 0;
+  uint32_t last_wait_bind_log_ms = 0;
+  uint32_t last_wait_ws_log_ms = 0;
+  uint32_t last_no_change_log_ms = 0;
+  uint32_t last_send_throttle_log_ms = 0;
+  bool prev_ws_connected = false;
+  bool need_full_sync = true;
+
+  ServoOutputFilter servo_filter;
+  int last_sent_angles[SERVO_ID_COUNT] = {0};
+  bool last_sent_valid[SERVO_ID_COUNT] = {false};
+
   while (true) {
     EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
     if (bits & WIFI_CONNECTED_BIT) {
       uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+      bool ws_connected = is_ws_connected();
+
+      if (ws_connected && !prev_ws_connected) {
+        need_full_sync = true;
+        ESP_LOGI(TAG, "WebSocket恢复连接, 下次发送全量同步");
+      }
+      prev_ws_connected = ws_connected;
+
       if (now_ms - last_send_ms >= SEND_INTERVAL_MS) {
         last_send_ms = now_ms;
 
-        std::pair<int, int> servoParams[SEND_CHANNELS];
-        for (int ch = 0; ch < SEND_CHANNELS; ch++) {
-          servoParams[ch] = {ch + 21, (int)readChannel(ch)};
-        }
+        if (ws_target_id[0] != '\0') {
+          if (ws_connected) {
+            std::pair<int, int> currentParams[SERVO_ID_COUNT];
+            std::pair<int, int> deltaParams[SERVO_ID_COUNT];
+            build_servo_params(currentParams, &servo_filter);
 
-        sendServoControl(servoParams, SEND_CHANNELS);
-        if (g_send_as_servo_control) {
-          sendServoControlAsServerControl(servoParams, SEND_CHANNELS);
-        }
+            size_t delta_count = collect_servo_deltas(currentParams, last_sent_angles, last_sent_valid, need_full_sync, deltaParams);
+            if (delta_count == 0) {
+              if (now_ms - last_no_change_log_ms >= NO_CHANGE_LOG_INTERVAL_MS) {
+                last_no_change_log_ms = now_ms;
+                ESP_LOGI(TAG, "舵机无变化, 本周期不发送");
+              }
+            } else {
+              size_t sent_total = 0;
+              size_t offset = 0;
+              size_t sent_batches = 0;
+              while (offset < delta_count && sent_batches < (size_t)SERVO_MAX_BATCH_PER_TICK) {
+                size_t remain = delta_count - offset;
+                size_t batch_count = remain > (size_t)SERVO_SEND_BATCH_MAX ? (size_t)SERVO_SEND_BATCH_MAX : remain;
+                bool ok = sendServoControl(deltaParams + offset, batch_count);
+                if (!ok) {
+                  ESP_LOGW(TAG, "增量发送失败, 已发送=%u, 总计=%u", (unsigned)sent_total, (unsigned)delta_count);
+                  break;
+                }
 
-        ESP_LOGI(TAG, "等待绑定尚未获取目标ID, 跳过发送");
+                update_last_sent_state(deltaParams + offset, batch_count, last_sent_angles, last_sent_valid);
+                if (ENABLE_SERVER_CONTROL_MIRROR && g_send_as_servo_control) {
+                  sendServoControlAsServerControl(deltaParams + offset, batch_count);
+                }
+                sent_total += batch_count;
+                offset += batch_count;
+                sent_batches++;
+              }
+
+              if (offset < delta_count && now_ms - last_send_throttle_log_ms >= SEND_THROTTLE_LOG_INTERVAL_MS) {
+                last_send_throttle_log_ms = now_ms;
+                ESP_LOGW(TAG, "发送限流生效, 本周期发送=%u, 待发送=%u", (unsigned)sent_total, (unsigned)(delta_count - sent_total));
+              }
+
+              if (need_full_sync && sent_total == delta_count) {
+                need_full_sync = false;
+                ESP_LOGI(TAG, "全量同步完成, 切换为增量发送");
+              }
+            }
+          } else if (now_ms - last_wait_ws_log_ms >= WAIT_WS_LOG_INTERVAL_MS) {
+            last_wait_ws_log_ms = now_ms;
+            ESP_LOGW(TAG, "WebSocket未连接, 暂停发送(目标ID=%s)", ws_target_id);
+          }
+        } else if (now_ms - last_wait_bind_log_ms >= WAIT_BIND_LOG_INTERVAL_MS) {
+          last_wait_bind_log_ms = now_ms;
+          ESP_LOGI(TAG, "等待绑定: 尚未获取目标ID(name=%s), 跳过发送", TARGET_NAME);
+        }
       }
 
-      if (now_ms - last_heartbeat_ms > 15000) {
-        _ws_send("{\"type\":\"heartbeat\"}");
-        last_heartbeat_ms = now_ms;
-        ESP_LOGI(TAG, "已发送WebSocket心跳包");
+      if (ws_connected && now_ms - last_heartbeat_ms > 15000) {
+        if (_ws_send("{\"type\":\"heartbeat\"}")) {
+          last_heartbeat_ms = now_ms;
+          ESP_LOGI(TAG, "已发送WebSocket心跳包");
+        }
       }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -533,8 +776,7 @@ extern "C" void app_main(void) {
 
   ESP_LOGI(TAG, "读取到的设备名: %s", g_board_name);
 
-  initPins();
-  setupADC();
+  ensureMuxADC();
 
   wifi_init_sta(g_ssid, g_pass);
 

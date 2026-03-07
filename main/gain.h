@@ -21,28 +21,38 @@ static inline int clampi(int v, int lo, int hi) {
 }
 
 // ================== 引脚定义 ==================
-#define MUX_S0   GPIO_NUM_16
-#define MUX_S1   GPIO_NUM_17
-#define MUX_S2   GPIO_NUM_18
-#define MUX_S3   GPIO_NUM_19
-#define MUX_EN   GPIO_NUM_21      // 若EN接地，注释此行及相关代码
-#define MUX_SIG_GPIO  GPIO_NUM_34 // ADC输入引脚
-#define MUX_SIG_ADC_CHANNEL ADC_CHANNEL_6
+// ---------- 第一片 MUX ----------
+#define MUX1_S0   GPIO_NUM_16
+#define MUX1_S1   GPIO_NUM_17
+#define MUX1_S2   GPIO_NUM_18
+#define MUX1_S3   GPIO_NUM_19
+#define MUX1_SIG_ADC_CHANNEL ADC_CHANNEL_6  // GPIO34
+
+// ---------- 第二片 MUX ----------
+#define MUX2_S0   GPIO_NUM_13
+#define MUX2_S1   GPIO_NUM_12
+#define MUX2_S2   GPIO_NUM_14
+#define MUX2_S3   GPIO_NUM_27
+#define MUX2_SIG_ADC_CHANNEL ADC_CHANNEL_7  // GPIO35
+
+// 可选使能引脚（若硬件接了共用使能，可取消注释）
+// #define MUX_EN   GPIO_NUM_21
 
 // 读数相关参数
 #define ADC_BITS         12                  // 12位ADC
 #define ADC_MAX_VALUE    ((1 << ADC_BITS) - 1) // 4095
 #define ADC_ATTEN        ADC_ATTEN_DB_12     // 0~3.3V量程
-#define SAMPLE_COUNT     4                   // 采样次数（取平均）
-#define SETTLE_US        8                   // 通道切换稳定时间(us)
-#define SEND_CHANNELS    16                  // 16路通道
+#define SAMPLE_COUNT     6                   // 采样次数（取平均）
+#define SETTLE_US        20                  // 通道切换稳定时间(us)
+#define SEND_CHANNELS    32                  // 32路通道（16+16）
 
 // ================== 硬件初始化 ==================
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 static bool s_adc_inited = false;
 
 inline void initPins() {
-  uint64_t mask = (1ULL << MUX_S0) | (1ULL << MUX_S1) | (1ULL << MUX_S2) | (1ULL << MUX_S3);
+  uint64_t mask = (1ULL << MUX1_S0) | (1ULL << MUX1_S1) | (1ULL << MUX1_S2) | (1ULL << MUX1_S3)
+                | (1ULL << MUX2_S0) | (1ULL << MUX2_S1) | (1ULL << MUX2_S2) | (1ULL << MUX2_S3);
 #ifdef MUX_EN
   mask |= (1ULL << MUX_EN);
 #endif
@@ -73,14 +83,15 @@ inline void setupADC() {
     .atten = ADC_ATTEN,
     .bitwidth = ADC_BITWIDTH_12,
   };
-  adc_oneshot_config_channel(s_adc_handle, MUX_SIG_ADC_CHANNEL, &chan_cfg);
+  adc_oneshot_config_channel(s_adc_handle, MUX1_SIG_ADC_CHANNEL, &chan_cfg);
+  adc_oneshot_config_channel(s_adc_handle, MUX2_SIG_ADC_CHANNEL, &chan_cfg);
 }
 
 inline void ensureMuxADC() {
   if (!s_adc_inited) {
     initPins();
     setupADC();
-    s_adc_inited = true;
+    s_adc_inited = (s_adc_handle != NULL);
   }
 }
 
@@ -93,18 +104,26 @@ inline float Angle(int adc) {
 }
 
 // ================== 采样控制 ==================
-// 切换多路选择器通道
-inline void muxSelect(uint8_t ch) {
-  gpio_set_level(MUX_S0, ch & 0x01);
-  gpio_set_level(MUX_S1, (ch >> 1) & 0x01);
-  gpio_set_level(MUX_S2, (ch >> 2) & 0x01);
-  gpio_set_level(MUX_S3, (ch >> 3) & 0x01);
+// 切换第一片多路选择器通道
+inline void mux1Select(uint8_t ch) {
+  gpio_set_level(MUX1_S0, ch & 0x01);
+  gpio_set_level(MUX1_S1, (ch >> 1) & 0x01);
+  gpio_set_level(MUX1_S2, (ch >> 2) & 0x01);
+  gpio_set_level(MUX1_S3, (ch >> 3) & 0x01);
 }
 
-static inline int readRawOnce() {
+// 切换第二片多路选择器通道
+inline void mux2Select(uint8_t ch) {
+  gpio_set_level(MUX2_S0, ch & 0x01);
+  gpio_set_level(MUX2_S1, (ch >> 1) & 0x01);
+  gpio_set_level(MUX2_S2, (ch >> 2) & 0x01);
+  gpio_set_level(MUX2_S3, (ch >> 3) & 0x01);
+}
+
+static inline int readRawOnce(adc_channel_t adc_channel) {
   int raw = 0;
   if (s_adc_handle) {
-    if (adc_oneshot_read(s_adc_handle, MUX_SIG_ADC_CHANNEL, &raw) != ESP_OK) {
+    if (adc_oneshot_read(s_adc_handle, adc_channel, &raw) != ESP_OK) {
       raw = 0;
     }
   }
@@ -114,33 +133,60 @@ static inline int readRawOnce() {
 // 读取指定通道ADC值（限制在0~4095）
 inline float readChannel(uint8_t ch, uint8_t samples = SAMPLE_COUNT) {
   ensureMuxADC();
-  muxSelect(ch);
+
+  uint8_t mux_ch = ch % 16;
+  adc_channel_t adc_channel = MUX1_SIG_ADC_CHANNEL;
+  if (ch < 16) {
+    mux1Select(mux_ch);
+    adc_channel = MUX1_SIG_ADC_CHANNEL;
+  } else {
+    mux2Select(mux_ch);
+    adc_channel = MUX2_SIG_ADC_CHANNEL;
+  }
+
   esp_rom_delay_us(SETTLE_US);
-  (void)readRawOnce(); // 丢弃第一次不稳定读数
+  (void)readRawOnce(adc_channel); // 丢弃前两次不稳定读数
+  (void)readRawOnce(adc_channel);
 
   uint32_t acc = 0;
+  int vmin = ADC_MAX_VALUE;
+  int vmax = 0;
   for (uint8_t i = 0; i < samples; i++) {
-    acc += (uint32_t)readRawOnce();
+    int v = readRawOnce(adc_channel);
+    if (v < 0) v = 0;
+    if (v > ADC_MAX_VALUE) v = ADC_MAX_VALUE;
+    if (v < vmin) vmin = v;
+    if (v > vmax) vmax = v;
+    acc += (uint32_t)v;
   }
-  int rawValue = (int)(acc / samples);
+  uint8_t denom = samples;
+  if (samples >= 3) {
+    acc -= (uint32_t)vmin; // 去掉最小值
+    acc -= (uint32_t)vmax; // 去掉最大值
+    denom = samples - 2;
+  }
+  int rawValue = (int)(acc / (denom ? denom : 1));
   return Angle(clampi(rawValue, 0, ADC_MAX_VALUE));
 }
 
 // ================== ADC→脉宽映射 ==================
 static inline int adcToPulse(int adc, int idx) {
-  int amin = ADC_MIN16[idx];
-  int amax = ADC_MAX16[idx];
+  int calib_idx = idx % 16;
+  if (calib_idx < 0) calib_idx += 16;
+
+  int amin = ADC_MIN16[calib_idx];
+  int amax = ADC_MAX16[calib_idx];
   if (amax <= amin) return SERVO_PULSE_MIN;
 
   float t = (float)(adc - amin) / (float)(amax - amin);
   t = clampi((int)(t * 1000.0f), 0, 1000) / 1000.0f;
-  if (ADC_INVERT16[idx]) t = 1.0f - t;
+  if (ADC_INVERT16[calib_idx]) t = 1.0f - t;
 
   int pulse = (int)lroundf(SERVO_PULSE_MIN + t * (SERVO_PULSE_MAX - SERVO_PULSE_MIN));
   return clampi(pulse, SERVO_PULSE_MIN, SERVO_PULSE_MAX);
 }
 
-// 读取16路并发送控制指令
+// 读取全部通道并发送控制指令
 inline void readAll16AndSendServos() {
   std::pair<int, int> servoPairs[SEND_CHANNELS];
   for (int ch = 0; ch < SEND_CHANNELS; ch++) {

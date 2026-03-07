@@ -12,14 +12,19 @@ extern esp_websocket_client_handle_t ws_client;
 extern char ws_target_id[];
 
 static const char* TAG_SEND = "send";
+static const TickType_t WS_SEND_TIMEOUT_TICKS = pdMS_TO_TICKS(3000);
+
+static inline bool _ws_is_connected() {
+  return ws_client && esp_websocket_client_is_connected(ws_client);
+}
 
 // WebSocket消息发送通用函数
 static inline bool _ws_send(const char* json) {
-  if (!ws_client || !json) {
+  if (!json || !_ws_is_connected()) {
     return false;
   }
   ESP_LOGI(TAG_SEND, "发送消息: %s", json);
-  int ret = esp_websocket_client_send_text(ws_client, json, (int)strlen(json), pdMS_TO_TICKS(1000));
+  int ret = esp_websocket_client_send_text(ws_client, json, (int)strlen(json), WS_SEND_TIMEOUT_TICKS);
   return ret >= 0;
 }
 
