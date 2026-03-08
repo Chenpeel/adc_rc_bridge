@@ -41,6 +41,21 @@ static const float SERVO_GROUP_A_MAX_DEG = 240.0f;
 static const float SERVO_GROUP_B_MAX_DEG = 270.0f;
 static const float SEND_MIN_DEG = -90.0f;
 static const float SEND_MAX_DEG = 90.0f;
+static const int ADC_CODE_MAX = 4095;
+static const int ADC_BP0 = 0;
+static const int ADC_BP1 = 1023;
+static const int ADC_BP2 = 2047;
+static const int ADC_BP3 = 3071;
+static const int ADC_BP4 = 4095;
+// 每路归一化区间（原始ADC码值，0~4095）
+static const int ADC_NORM_MIN[SERVO_ID_COUNT] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static const int ADC_NORM_MAX[SERVO_ID_COUNT] = {
+    4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095,
+    4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095};
+// 每路相位偏移（单位：ADC码值，正值=向更大码值方向平移，负值相反）
+static const int ADC_PHASE_OFFSET[SERVO_ID_COUNT] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static const uint8_t DEBUG_SERVO_IDS[] = {21, 22, 23, 32, 33, 34, 35, 41, 42, 43};
 static const size_t DEBUG_SERVO_ID_COUNT = sizeof(DEBUG_SERVO_IDS) / sizeof(DEBUG_SERVO_IDS[0]);
 
@@ -77,34 +92,49 @@ static inline float clampf(float v, float lo, float hi) {
   return v;
 }
 
-static inline float wrap_deg_360(float deg) {
-  float wrapped = fmodf(deg, 360.0f);
-  if (wrapped < 0.0f) {
-    wrapped += 360.0f;
-  }
-  return wrapped;
-}
-
 static inline float servo_max_deg(uint8_t servo_id) {
   return (servo_id <= SERVO_GROUP_A_MAX_ID) ? SERVO_GROUP_A_MAX_DEG : SERVO_GROUP_B_MAX_DEG;
 }
 
-static inline float map_adc_angle_to_servo_deg(uint8_t servo_id, float adc_angle_deg) {
-  // 目标映射(等价ADC码值):
-  // 3072(≈270deg) -> 0deg, 0/4095(≈0/360deg) -> reset, 1024(≈90deg) -> max
-  float phase = wrap_deg_360(adc_angle_deg - 270.0f);
-  float ratio = (phase <= 180.0f) ? (phase / 180.0f) : ((360.0f - phase) / 180.0f);
-  return clampf(ratio, 0.0f, 1.0f) * servo_max_deg(servo_id);
+static inline int adc_deg_to_code(float adc_deg) {
+  float deg = clampf(adc_deg, 0.0f, 360.0f);
+  int code = (int)roundf(deg * (float)ADC_CODE_MAX / 360.0f);
+  return clampi(code, 0, ADC_CODE_MAX);
 }
 
-static inline float servo_deg_to_send_deg(uint8_t servo_id, float servo_deg) {
-  float max_deg = servo_max_deg(servo_id);
-  float reset_deg = max_deg * 0.5f;
-  float deg = clampf(servo_deg, 0.0f, max_deg);
-  if (reset_deg <= 0.0f) {
-    return 0.0f;
+static inline int wrap_code(int code) {
+  int range = ADC_CODE_MAX + 1;
+  int wrapped = code % range;
+  if (wrapped < 0) wrapped += range;
+  return wrapped;
+}
+
+static inline int normalize_adc_code(size_t idx, int raw_code) {
+  int lo = clampi(ADC_NORM_MIN[idx], 0, ADC_CODE_MAX - 1);
+  int hi = clampi(ADC_NORM_MAX[idx], lo + 1, ADC_CODE_MAX);
+  int c = clampi(raw_code, lo, hi);
+  int norm = (int)roundf((float)(c - lo) * (float)ADC_CODE_MAX / (float)(hi - lo));
+  return clampi(norm, 0, ADC_CODE_MAX);
+}
+
+static inline bool map_adc_code_to_send_deg(int adc_code, float* out_send_deg) {
+  if (!out_send_deg) return false;
+  int code = clampi(adc_code, 0, ADC_CODE_MAX);
+
+  // 仅保留以下有效区间并线性映射:
+  // 3071 -> 4095/0 -> 1023  对应  -90 -> 0 -> 90
+  // 其余(1024~3070)区间返回false，表示屏蔽更新
+  if (code >= ADC_BP3) {
+    float t = (float)(code - ADC_BP3) / (float)(ADC_BP4 - ADC_BP3); // 0 -> 1
+    *out_send_deg = SEND_MIN_DEG + t * (0.0f - SEND_MIN_DEG);       // -90 -> 0
+    return true;
   }
-  return (deg - reset_deg) * (90.0f / reset_deg);
+  if (code <= ADC_BP1) {
+    float t = (float)(code - ADC_BP0) / (float)(ADC_BP1 - ADC_BP0); // 0 -> 1
+    *out_send_deg = 0.0f + t * SEND_MAX_DEG;                         // 0 -> 90
+    return true;
+  }
+  return false;
 }
 
 static inline float send_deg_to_servo_deg(uint8_t servo_id, float send_deg) {
@@ -224,21 +254,34 @@ static void adc_capture_task(void* arg) {
   uint16_t seq = 0;
   ServoSnapshot next = {};
   uint32_t last_debug_log_ms = 0;
-  float adc_deg_cache[SERVO_ID_COUNT] = {0.0f};
+  int adc_raw_cache[SERVO_ID_COUNT] = {0};
+  int adc_norm_cache[SERVO_ID_COUNT] = {0};
+  int adc_phase_cache[SERVO_ID_COUNT] = {0};
+  bool valid_cache[SERVO_ID_COUNT] = {false};
+  int16_t hold_send_deg_x10[SERVO_ID_COUNT] = {0};
 
   while (true) {
     next.seq = ++seq;
     next.uptime_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
     for (size_t idx = 0; idx < SERVO_ID_COUNT; idx++) {
-      uint8_t sid = (uint8_t)(SERVO_ID_MIN + idx);
       float adc_deg = clampf(readChannel((uint8_t)idx), 0.0f, 360.0f);
-      adc_deg_cache[idx] = adc_deg;
+      int adc_raw = adc_deg_to_code(adc_deg);
+      int adc_norm = normalize_adc_code(idx, adc_raw);
+      int adc_phase = wrap_code(adc_norm + ADC_PHASE_OFFSET[idx]);
+      adc_raw_cache[idx] = adc_raw;
+      adc_norm_cache[idx] = adc_norm;
+      adc_phase_cache[idx] = adc_phase;
 
-      float servo_deg = map_adc_angle_to_servo_deg(sid, adc_deg);
-      float send_deg = servo_deg_to_send_deg(sid, servo_deg);
-      int send_deg_x10 = (int)roundf(send_deg * 10.0f);
-      next.send_deg_x10[idx] = (int16_t)clampi(send_deg_x10, -900, 900);
+      float send_deg = 0.0f;
+      bool valid = map_adc_code_to_send_deg(adc_phase, &send_deg);
+      valid_cache[idx] = valid;
+      if (valid) {
+        int send_deg_x10 = (int)roundf(send_deg * 10.0f);
+        hold_send_deg_x10[idx] = (int16_t)clampi(send_deg_x10, -900, 900);
+      }
+      // 无效区间保持上一有效值，不更新输出（屏蔽发送变化）
+      next.send_deg_x10[idx] = hold_send_deg_x10[idx];
     }
 
     if (xSemaphoreTake(s_snapshot_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -256,17 +299,31 @@ static void adc_capture_task(void* arg) {
         int idx = (int)sid - (int)SERVO_ID_MIN;
         if (idx < 0 || idx >= (int)SERVO_ID_COUNT) continue;
 
-        float adc_deg = adc_deg_cache[idx];
+        int adc_raw = adc_raw_cache[idx];
+        int adc_norm = adc_norm_cache[idx];
+        int adc_phase = adc_phase_cache[idx];
         float send_deg = next.send_deg_x10[idx] / 10.0f;
-        float servo_deg = send_deg_to_servo_deg(sid, send_deg);
-
-        n = snprintf(line + used,
-                     (used < sizeof(line)) ? (sizeof(line) - used) : 0,
-                     "%u:%.1f->%.1f->%.1f ",
-                     (unsigned)sid,
-                     adc_deg,
-                     servo_deg,
-                     send_deg);
+        if (valid_cache[idx]) {
+          float servo_deg = send_deg_to_servo_deg(sid, send_deg);
+          n = snprintf(line + used,
+                       (used < sizeof(line)) ? (sizeof(line) - used) : 0,
+                       "%u:%d/%d/%d->%.1f->%.1f ",
+                       (unsigned)sid,
+                       adc_raw,
+                       adc_norm,
+                       adc_phase,
+                       servo_deg,
+                       send_deg);
+        } else {
+          n = snprintf(line + used,
+                       (used < sizeof(line)) ? (sizeof(line) - used) : 0,
+                       "%u:%d/%d/%d->MASK(%.1f) ",
+                       (unsigned)sid,
+                       adc_raw,
+                       adc_norm,
+                       adc_phase,
+                       send_deg);
+        }
         if (n > 0) {
           size_t inc = (size_t)n;
           if (used + inc < sizeof(line)) {
