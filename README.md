@@ -1,6 +1,6 @@
 # ADC_Remote_Control 
 
-本文档覆盖 Linux / Windows 双平台的环境配置、编译、烧录和排障流程。
+本文档覆盖 `rpi-esp` 架构下的环境配置、编译、烧录与联调流程。
 
 ## 1. 工程概览
 
@@ -13,16 +13,21 @@
 │   ├── CMakeLists.txt
 │   ├── main.cpp
 │   ├── gain.h
-│   ├── send.h
 │   └── idf_component.yml
+├── raspi/
+│   ├── bridge.py
+│   ├── requirements.txt
+│   ├── config.example.json
+│   └── README.md
 ├── sdkconfig.defaults
 └── dependencies.lock
 ```
 
 关键点：
 
-- 使用 `main/idf_component.yml` 拉取第三方组件。
-- `dependencies.lock` 锁定依赖版本。默认目标是 `esp32`。
+- ESP32 负责 `ADC + I2C 从机`，不再直接处理 WiFi/WebSocket。
+- Raspberry Pi OS 负责 `I2C 主机读取 + WebSocket 通信`。
+- 默认目标芯片仍为 `esp32`，烧录流程不变。
 
 ## 2. 版本建议
 
@@ -110,8 +115,7 @@ git clone https://github.com/Chenpeel/adc_rc_bridge.git adc_rc_bridge
 cd adc_rc_bridge
 ```
 
-首次构建时，ESP-IDF 会根据 `main/idf_component.yml` 自动下载组件。  
-需要确保网络可访问 `components.espressif.com`。
+本分支不依赖额外三方 ESP-IDF 组件，离线构建更稳定。
 
 可选：显式指定组件缓存目录（在受限环境里很有用）：
 
@@ -202,41 +206,51 @@ idf.py reconfigure
 idf.py app
 ```
 
-## 9. 项目运行时参数
+## 9. 运行参数
 
-可在 `main/main.cpp` 中修改：
+### 9.1 ESP32 (`main/main.cpp`)
 
-- 默认 WiFi：
-  - `DEFAULT_SSID = "gaoda"`
-  - `DEFAULT_PASS = "gaoda123"`
-- 默认设备名：`DEFAULT_NAME = "body"`
-- 目标设备名：`TARGET_NAME = "esp32"`
-- WebSocket 地址：`ws://192.168.0.100:9102/`
-- 发送周期：`SEND_INTERVAL_MS = 50`（20Hz）
+- I2C 从机地址：`0x28`
+- I2C 引脚：`SDA=GPIO21`、`SCL=GPIO22`
+- 请求命令：`0xA5`
+- 响应帧长度：`60 bytes`
+- 舵机通道范围：`21~43`（共23路）
+- ADC 采样周期：`ADC_CAPTURE_INTERVAL_MS = 15`
 
-WiFi 连接失败时，设备会进入 AP 配网模式：
+### 9.2 Raspberry Pi (`raspi/config.example.json`)
 
-- AP 名称：`ESP_32_AP`
-- AP 密码：`00000000`
-- 配网页面：`http://<AP_IP>/`
+- WebSocket 地址：`ws_uri`
+- 本机注册名：`ws_client_name`
+- 可选目标名：`ws_preferred_target_name`（空字符串表示不限制）
+- 发送周期：`send_interval_ms`
+- 抖动过滤：`filter_deadzone_deg`
+- 最小发送变化：`send_min_delta_deg`
 
-## 10. 常见问题排查
+## 10. 端到端启动步骤
 
-### 10.1 `Failed to resolve component 'esp_websocket_client'` / `cjson`
-
-检查项：
-
-1. 是否在正确 ESP-IDF 环境终端中执行（先 `idf.py --version`）。
-2. 是否存在 `main/idf_component.yml`。
-3. 网络是否可访问 `components.espressif.com`。
-4. 重新执行：
+1. 烧录 ESP32 固件：
 
 ```bash
-idf.py reconfigure
-idf.py build
+idf.py -p /dev/ttyUSB0 -b 460800 flash
 ```
 
-### 10.2 `IDF_PATH` 指向错误目录
+2. 在 Raspberry Pi OS 上运行桥接程序：
+
+```bash
+cd raspi
+uv sync --frozen
+cp config.example.json config.json
+uv run bridge.py --config config.json
+```
+
+3. 观察日志确认流程：
+- `I2C读取正常`
+- `WebSocket连接成功`
+- `绑定目标: ...`
+
+## 11. 常见问题排查
+
+### 11.1 `IDF_PATH` 指向错误目录
 
 现象：构建找不到 `project.cmake` 或 IDF 脚本路径错误。
 
@@ -249,7 +263,7 @@ idf.py build
 echo "$IDF_PATH"
 ```
 
-### 10.3 Linux 串口权限不足（`Permission denied`）
+### 11.2 Linux 串口权限不足（`Permission denied`）
 
 ```bash
 sudo usermod -aG dialout $USER
@@ -257,6 +271,15 @@ newgrp dialout
 ```
 
 或临时使用 `sudo`。
+
+### 11.3 Raspberry Pi I2C 权限问题
+
+```bash
+sudo usermod -aG i2c $USER
+newgrp i2c
+```
+
+并确认 `/boot/firmware/config.txt` 已启用 `dtparam=i2c_arm=on`。
 
 ### 10.4 串口找不到设备
 
