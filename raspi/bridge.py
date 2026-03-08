@@ -48,6 +48,9 @@ class BridgeConfig:
     ws_uri: str = "ws://192.168.0.100:9102/"
     ws_client_name: str = "rpi-body"
     ws_preferred_target_name: str = ""
+    ws_character_name: str = "jiyuan"
+    ws_is_bus_servo: bool = True
+    ws_servo_speed: int = 100
     ws_reconnect_delay_ms: int = 2000
     ws_heartbeat_interval_ms: int = 15000
 
@@ -403,8 +406,20 @@ class RaspiWsBridge:
             self.last_send_throttle_log = now
             logging.warning("发送限流生效, 本周期发送=%d, 待发送=%d", len(send_items), len(delta_items) - len(send_items))
 
+        speed = clamp_int(int(self.cfg.ws_servo_speed), 0, 1000)
         content = json.dumps(
-            [{"c": sid, "p": send_deg_to_command(sid, pos)} for sid, pos in send_items],
+            [
+                {
+                    "character_name": self.cfg.ws_character_name,
+                    "web_servo": {
+                        "is_bus_servo": bool(self.cfg.ws_is_bus_servo),
+                        "servo_id": sid,
+                        "position": send_deg_to_command(sid, pos),
+                        "speed": speed,
+                    },
+                }
+                for sid, pos in send_items
+            ],
             separators=(",", ":"),
             ensure_ascii=False,
         )

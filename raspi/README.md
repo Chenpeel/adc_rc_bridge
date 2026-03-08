@@ -43,7 +43,24 @@ uv run bridge.py --config config.json --ws-uri ws://192.168.0.100:9102/ --client
   - `21~34`: `0~240deg -> p=0~1000`
   - `35~43`: `0~270deg -> p=500~2500`
 
-## 5. 常见问题
+## 5. WebSocket 发送格式
+
+- `type=servo_control`
+- `content` 为 JSON 字符串，数组元素结构与协议一致：
+
+```json
+{
+  "character_name": "jiyuan",
+  "web_servo": {
+    "is_bus_servo": true,
+    "servo_id": 21,
+    "position": 173,
+    "speed": 100
+  }
+}
+```
+
+## 6. 常见问题
 
 1. `PermissionError: /dev/i2c-1`
    - 将用户加入 `i2c` 组，或使用 root 运行。
