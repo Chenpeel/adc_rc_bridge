@@ -1,3 +1,2 @@
 dependencies:
-  espressif/esp_websocket_client: "*"
-  espressif/cjson: "*"
+  idf: ">=6.1.0"

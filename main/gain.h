@@ -1,12 +1,10 @@
 #pragma once
 #include <stdint.h>
 #include <math.h>
-#include <utility>
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_err.h"
 #include "esp_rom_sys.h"
-#include "send.h"
 
 // ====== 可调映射参数（16路）======
 #define SERVO_PULSE_MIN  110     // 舵机最小脉宽
@@ -184,15 +182,4 @@ static inline int adcToPulse(int adc, int idx) {
 
   int pulse = (int)lroundf(SERVO_PULSE_MIN + t * (SERVO_PULSE_MAX - SERVO_PULSE_MIN));
   return clampi(pulse, SERVO_PULSE_MIN, SERVO_PULSE_MAX);
-}
-
-// 读取全部通道并发送控制指令
-inline void readAll16AndSendServos() {
-  std::pair<int, int> servoPairs[SEND_CHANNELS];
-  for (int ch = 0; ch < SEND_CHANNELS; ch++) {
-    float anglet = readChannel(ch);
-    int angle = (int)anglet;
-    servoPairs[ch] = {ch, angle};
-  }
-  sendServoControl(servoPairs, SEND_CHANNELS);
 }
