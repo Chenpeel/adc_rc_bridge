@@ -24,9 +24,14 @@ except ImportError as exc:  # pragma: no cover
 SERVO_ID_MIN = 21
 SERVO_ID_MAX = 43
 SERVO_COUNT = SERVO_ID_MAX - SERVO_ID_MIN + 1
+SERVO_GROUP_A_MAX_ID = 34  # 21~34
+SERVO_GROUP_A_MAX_DEG = 240.0
+SERVO_GROUP_B_MAX_DEG = 270.0
+SEND_MIN_DEG = -90
+SEND_MAX_DEG = 90
 
 FRAME_MAGIC = b"\xAA\x55"
-FRAME_VERSION = 1
+FRAME_VERSION = 2
 FRAME_SIZE = 60
 FRAME_HEADER_SIZE = 12
 CMD_GET_FRAME = 0xA5
@@ -58,11 +63,22 @@ class BridgeConfig:
 
 
 class ServoOutputFilter:
-    def __init__(self, alpha: float, deadzone: int, max_step: int, confirm_frames: int, count: int) -> None:
+    def __init__(
+        self,
+        alpha: float,
+        deadzone: int,
+        max_step: int,
+        confirm_frames: int,
+        min_value: int,
+        max_value: int,
+        count: int,
+    ) -> None:
         self.alpha = alpha
         self.deadzone = deadzone
         self.max_step = max_step
         self.confirm_frames = max(1, confirm_frames)
+        self.min_value = min_value
+        self.max_value = max_value
         self.filtered = [0.0] * count
         self.stable = [0] * count
         self.inited = [False] * count
@@ -71,14 +87,14 @@ class ServoOutputFilter:
 
     def apply(self, idx: int, raw_angle: float) -> int:
         if not self.inited[idx]:
-            out = clamp_int(int(round(raw_angle)), 0, 360)
+            out = clamp_int(int(round(raw_angle)), self.min_value, self.max_value)
             self.filtered[idx] = raw_angle
             self.stable[idx] = out
             self.inited[idx] = True
             return out
 
         self.filtered[idx] += self.alpha * (raw_angle - self.filtered[idx])
-        candidate = clamp_int(int(round(self.filtered[idx])), 0, 360)
+        candidate = clamp_int(int(round(self.filtered[idx])), self.min_value, self.max_value)
         delta = candidate - self.stable[idx]
         abs_delta = abs(delta)
 
@@ -107,7 +123,7 @@ class ServoOutputFilter:
         elif delta < -self.max_step:
             delta = -self.max_step
 
-        self.stable[idx] = clamp_int(self.stable[idx] + delta, 0, 360)
+        self.stable[idx] = clamp_int(self.stable[idx] + delta, self.min_value, self.max_value)
         return self.stable[idx]
 
 
@@ -139,6 +155,8 @@ class RaspiWsBridge:
             deadzone=cfg.filter_deadzone_deg,
             max_step=cfg.filter_max_step_per_tick,
             confirm_frames=cfg.filter_confirm_frames,
+            min_value=SEND_MIN_DEG,
+            max_value=SEND_MAX_DEG,
             count=SERVO_COUNT,
         )
 
@@ -157,7 +175,6 @@ class RaspiWsBridge:
         self.last_wait_bind_log = 0.0
         self.last_no_change_log = 0.0
         self.last_send_throttle_log = 0.0
-        self.last_send_ok_log = 0.0
 
     async def run(self) -> None:
         poll_task = asyncio.create_task(self.i2c_poll_loop(), name="i2c_poll")
@@ -180,8 +197,8 @@ class RaspiWsBridge:
                     await asyncio.sleep(retry_interval)
                     continue
 
-                seq, uptime_ms, raw_angles = parsed
-                filtered = [self.servo_filter.apply(i, raw_angles[i]) for i in range(SERVO_COUNT)]
+                seq, uptime_ms, send_angles = parsed
+                filtered = [self.servo_filter.apply(i, send_angles[i]) for i in range(SERVO_COUNT)]
 
                 async with self.state_lock:
                     self.latest_seq = seq
@@ -387,7 +404,7 @@ class RaspiWsBridge:
             logging.warning("发送限流生效, 本周期发送=%d, 待发送=%d", len(send_items), len(delta_items) - len(send_items))
 
         content = json.dumps(
-            [{"c": sid, "p": pos} for sid, pos in send_items],
+            [{"c": sid, "p": send_deg_to_command(sid, pos)} for sid, pos in send_items],
             separators=(",", ":"),
             ensure_ascii=False,
         )
@@ -405,10 +422,6 @@ class RaspiWsBridge:
                 self.need_full_sync = False
                 logging.info("全量同步完成，切换增量发送")
 
-        if now - self.last_send_ok_log >= 1.0:
-            self.last_send_ok_log = now
-            logging.info("已发送: target=%s count=%d", target_id, len(send_items))
-
     async def ws_send_json(self, ws: websockets.WebSocketClientProtocol, obj: dict[str, Any]) -> None:
         await ws.send(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
 
@@ -419,6 +432,38 @@ def clamp_int(v: int, lo: int, hi: int) -> int:
     if v > hi:
         return hi
     return v
+
+
+def clamp_float(v: float, lo: float, hi: float) -> float:
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def servo_max_deg(servo_id: int) -> float:
+    return SERVO_GROUP_A_MAX_DEG if servo_id <= SERVO_GROUP_A_MAX_ID else SERVO_GROUP_B_MAX_DEG
+
+
+def send_deg_to_servo_deg(servo_id: int, send_deg: float) -> float:
+    max_deg = servo_max_deg(servo_id)
+    reset_deg = max_deg * 0.5
+    clamped = clamp_float(send_deg, float(SEND_MIN_DEG), float(SEND_MAX_DEG))
+    return clamp_float(reset_deg + clamped * (reset_deg / 90.0), 0.0, max_deg)
+
+
+def send_deg_to_command(servo_id: int, send_deg: int) -> int:
+    max_deg = servo_max_deg(servo_id)
+    servo_deg = send_deg_to_servo_deg(servo_id, float(send_deg))
+    t = servo_deg / max_deg if max_deg > 0 else 0.0
+
+    if servo_id <= SERVO_GROUP_A_MAX_ID:
+        # 21~34: 0~240deg -> 0~1000
+        return clamp_int(int(round(1000.0 * t)), 0, 1000)
+
+    # 35~43: 0~270deg -> 500~2500
+    return clamp_int(int(round(500.0 + 2000.0 * t)), 500, 2500)
 
 
 def crc16_ccitt_false(data: bytes) -> int:
@@ -462,14 +507,14 @@ def parse_adc_frame(frame: bytes) -> Optional[tuple[int, int, list[float]]]:
         logging.warning("I2C帧servo_id_min不匹配: %d", servo_id_min)
         return None
 
-    angles: list[float] = []
+    send_angles: list[float] = []
     base = FRAME_HEADER_SIZE
     for idx in range(SERVO_COUNT):
         pos = base + idx * 2
-        angle_x10 = int.from_bytes(frame[pos : pos + 2], "little")
-        angles.append(angle_x10 / 10.0)
+        send_x10 = int.from_bytes(frame[pos : pos + 2], "little", signed=True)
+        send_angles.append(clamp_float(send_x10 / 10.0, float(SEND_MIN_DEG), float(SEND_MAX_DEG)))
 
-    return seq, uptime_ms, angles
+    return seq, uptime_ms, send_angles
 
 
 def parse_i2c_addr(value: Any) -> int:

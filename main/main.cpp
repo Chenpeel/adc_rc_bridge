@@ -1,4 +1,6 @@
 #include <inttypes.h>
+#include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -34,37 +36,91 @@ static const size_t I2C_SLAVE_TX_BUF_LEN = 256;
 static const uint32_t ADC_CAPTURE_INTERVAL_MS = 15; // ~66Hz
 static const uint32_t I2C_CMD_WAIT_MS = 100;
 static const uint32_t ADC_DEBUG_LOG_INTERVAL_MS = 1000;
+static const uint8_t SERVO_GROUP_A_MAX_ID = 34; // 21~34
+static const float SERVO_GROUP_A_MAX_DEG = 240.0f;
+static const float SERVO_GROUP_B_MAX_DEG = 270.0f;
+static const float SEND_MIN_DEG = -90.0f;
+static const float SEND_MAX_DEG = 90.0f;
+static const uint8_t DEBUG_SERVO_IDS[] = {21, 22, 23, 32, 33, 34, 35, 41, 42, 43};
+static const size_t DEBUG_SERVO_ID_COUNT = sizeof(DEBUG_SERVO_IDS) / sizeof(DEBUG_SERVO_IDS[0]);
 
 // ====== 数据帧协议 ======
 // 帧格式(共60字节, 小端):
 // [0]   magic0      = 0xAA
 // [1]   magic1      = 0x55
-// [2]   version     = 1
+// [2]   version     = 2
 // [3]   channel_cnt = 23
 // [4:6] seq
 // [6:10]uptime_ms
 // [10]  servo_id_min=21
 // [11]  reserved    =0
-// [12:58] angles_x10[23] (uint16, 单位0.1度)
+// [12:58] send_deg_x10[23] (int16, 单位0.1度, 范围-90.0~90.0)
 // [58:60] crc16_ccitt_false (对前58字节计算)
 static const uint8_t FRAME_MAGIC0 = 0xAA;
 static const uint8_t FRAME_MAGIC1 = 0x55;
-static const uint8_t FRAME_VERSION = 1;
+static const uint8_t FRAME_VERSION = 2;
 static const size_t FRAME_SIZE = 60;
 static_assert(FRAME_SIZE == (12 + SERVO_ID_COUNT * 2 + 2), "unexpected frame size");
 
 struct ServoSnapshot {
   uint16_t seq = 0;
   uint32_t uptime_ms = 0;
-  uint16_t angles_x10[SERVO_ID_COUNT] = {0};
+  int16_t send_deg_x10[SERVO_ID_COUNT] = {0};
 };
 
 static ServoSnapshot s_latest_snapshot;
 static SemaphoreHandle_t s_snapshot_mutex = nullptr;
 
+static inline float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static inline float wrap_deg_360(float deg) {
+  float wrapped = fmodf(deg, 360.0f);
+  if (wrapped < 0.0f) {
+    wrapped += 360.0f;
+  }
+  return wrapped;
+}
+
+static inline float servo_max_deg(uint8_t servo_id) {
+  return (servo_id <= SERVO_GROUP_A_MAX_ID) ? SERVO_GROUP_A_MAX_DEG : SERVO_GROUP_B_MAX_DEG;
+}
+
+static inline float map_adc_angle_to_servo_deg(uint8_t servo_id, float adc_angle_deg) {
+  // 目标映射(等价ADC码值):
+  // 3072(≈270deg) -> 0deg, 0/4095(≈0/360deg) -> reset, 1024(≈90deg) -> max
+  float phase = wrap_deg_360(adc_angle_deg - 270.0f);
+  float ratio = (phase <= 180.0f) ? (phase / 180.0f) : ((360.0f - phase) / 180.0f);
+  return clampf(ratio, 0.0f, 1.0f) * servo_max_deg(servo_id);
+}
+
+static inline float servo_deg_to_send_deg(uint8_t servo_id, float servo_deg) {
+  float max_deg = servo_max_deg(servo_id);
+  float reset_deg = max_deg * 0.5f;
+  float deg = clampf(servo_deg, 0.0f, max_deg);
+  if (reset_deg <= 0.0f) {
+    return 0.0f;
+  }
+  return (deg - reset_deg) * (90.0f / reset_deg);
+}
+
+static inline float send_deg_to_servo_deg(uint8_t servo_id, float send_deg) {
+  float max_deg = servo_max_deg(servo_id);
+  float reset_deg = max_deg * 0.5f;
+  float s = clampf(send_deg, SEND_MIN_DEG, SEND_MAX_DEG);
+  return clampf(reset_deg + s * (reset_deg / 90.0f), 0.0f, max_deg);
+}
+
 static inline void write_u16_le(uint8_t* p, uint16_t v) {
   p[0] = (uint8_t)(v & 0xFF);
   p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+static inline void write_i16_le(uint8_t* p, int16_t v) {
+  write_u16_le(p, (uint16_t)v);
 }
 
 static inline void write_u32_le(uint8_t* p, uint32_t v) {
@@ -120,7 +176,7 @@ static size_t build_adc_frame(uint8_t* frame, size_t cap) {
   frame[pos++] = 0; // reserved
 
   for (size_t i = 0; i < SERVO_ID_COUNT; i++) {
-    write_u16_le(frame + pos, snap.angles_x10[i]);
+    write_i16_le(frame + pos, snap.send_deg_x10[i]);
     pos += 2;
   }
 
@@ -168,15 +224,21 @@ static void adc_capture_task(void* arg) {
   uint16_t seq = 0;
   ServoSnapshot next = {};
   uint32_t last_debug_log_ms = 0;
+  float adc_deg_cache[SERVO_ID_COUNT] = {0.0f};
 
   while (true) {
     next.seq = ++seq;
     next.uptime_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
     for (size_t idx = 0; idx < SERVO_ID_COUNT; idx++) {
-      float angle = readChannel((uint8_t)idx);
-      int angle_x10 = (int)(angle * 10.0f + 0.5f);
-      next.angles_x10[idx] = (uint16_t)clampi(angle_x10, 0, 3600);
+      uint8_t sid = (uint8_t)(SERVO_ID_MIN + idx);
+      float adc_deg = clampf(readChannel((uint8_t)idx), 0.0f, 360.0f);
+      adc_deg_cache[idx] = adc_deg;
+
+      float servo_deg = map_adc_angle_to_servo_deg(sid, adc_deg);
+      float send_deg = servo_deg_to_send_deg(sid, servo_deg);
+      int send_deg_x10 = (int)roundf(send_deg * 10.0f);
+      next.send_deg_x10[idx] = (int16_t)clampi(send_deg_x10, -900, 900);
     }
 
     if (xSemaphoreTake(s_snapshot_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -186,12 +248,43 @@ static void adc_capture_task(void* arg) {
 
     if (next.uptime_ms - last_debug_log_ms >= ADC_DEBUG_LOG_INTERVAL_MS) {
       last_debug_log_ms = next.uptime_ms;
-      ESP_LOGI(TAG,
-               "ADC seq=%u ch21=%.1f ch22=%.1f ch23=%.1f",
-               (unsigned)next.seq,
-               next.angles_x10[0] / 10.0f,
-               next.angles_x10[1] / 10.0f,
-               next.angles_x10[2] / 10.0f);
+      char line[256] = {0};
+      int n = snprintf(line, sizeof(line), "MAP seq=%u ", (unsigned)next.seq);
+      size_t used = (n > 0) ? (size_t)n : 0U;
+      for (size_t i = 0; i < DEBUG_SERVO_ID_COUNT; i++) {
+        uint8_t sid = DEBUG_SERVO_IDS[i];
+        int idx = (int)sid - (int)SERVO_ID_MIN;
+        if (idx < 0 || idx >= (int)SERVO_ID_COUNT) continue;
+
+        float adc_deg = adc_deg_cache[idx];
+        float send_deg = next.send_deg_x10[idx] / 10.0f;
+        float servo_deg = send_deg_to_servo_deg(sid, send_deg);
+
+        n = snprintf(line + used,
+                     (used < sizeof(line)) ? (sizeof(line) - used) : 0,
+                     "%u:%.1f->%.1f->%.1f ",
+                     (unsigned)sid,
+                     adc_deg,
+                     servo_deg,
+                     send_deg);
+        if (n > 0) {
+          size_t inc = (size_t)n;
+          if (used + inc < sizeof(line)) {
+            used += inc;
+          } else {
+            used = sizeof(line) - 1;
+          }
+        }
+
+        if (i == 4) {
+          ESP_LOGI(TAG, "%s", line);
+          line[0] = '\0';
+          used = 0;
+        }
+      }
+      if (used > 0) {
+        ESP_LOGI(TAG, "%s", line);
+      }
     }
 
     vTaskDelay(pdMS_TO_TICKS(ADC_CAPTURE_INTERVAL_MS));
