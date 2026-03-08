@@ -25,7 +25,7 @@
 #include "send.h"
 
 static const char* TAG = "app";
-static const char* TARGET_NAME = "esp32";
+static const char* PREFERRED_TARGET_NAME = ""; // 为空表示不限制目标名称，自动绑定第一个非本机客户端
 static const uint32_t SEND_INTERVAL_MS = 30; // ~33Hz, 更低控制延迟
 static const uint32_t WAIT_BIND_LOG_INTERVAL_MS = 3000; // 未绑定目标时日志限频
 static const uint32_t WAIT_WS_LOG_INTERVAL_MS = 3000; // WebSocket未连接时日志限频
@@ -64,11 +64,17 @@ static_assert(SERVO_MAX_BATCH_PER_TICK > 0, "SERVO_MAX_BATCH_PER_TICK must be po
 static const char* DEFAULT_SSID = "gaoda";
 static const char* DEFAULT_PASS = "gaoda123";
 static const char* DEFAULT_NAME = "body";
+static const int WIFI_CONNECT_WAIT_MS = 45000;
+static const int WIFI_MAX_RETRY_TOTAL = 40;
+static const int WIFI_MAX_RETRY_AUTH_FAIL = 8;
+static const int WIFI_MAX_RETRY_NO_AP = 12;
 
 static EventGroupHandle_t s_wifi_event_group;
 static const int WIFI_CONNECTED_BIT = BIT0;
 static const int WIFI_FAIL_BIT = BIT1;
 static int s_retry_num = 0;
+static int s_retry_auth_fail = 0;
+static int s_retry_no_ap = 0;
 
 static bool g_send_as_servo_control = false;
 
@@ -78,6 +84,7 @@ static char g_board_name[32] = "body";
 
 // WebSocket globals used by send.h
 esp_websocket_client_handle_t ws_client = NULL;
+char ws_self_id[64] = {0};
 char ws_target_id[64] = {0};
 
 static httpd_handle_t s_httpd = NULL;
@@ -85,6 +92,10 @@ static bool s_ap_netif_created = false;
 
 static inline bool is_ws_connected() {
   return (ws_client != NULL) && esp_websocket_client_is_connected(ws_client);
+}
+
+static inline bool has_preferred_target_name() {
+  return PREFERRED_TARGET_NAME && PREFERRED_TARGET_NAME[0] != '\0';
 }
 
 struct ServoOutputFilter {
@@ -260,15 +271,6 @@ static esp_err_t nvs_save_str(const char* key, const char* val) {
   return err;
 }
 
-static void nvs_clear_wifi() {
-  nvs_handle_t h;
-  if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) {
-    nvs_erase_all(h);
-    nvs_commit(h);
-    nvs_close(h);
-  }
-}
-
 static void scan_networks() {
   ESP_LOGI(TAG, "Scanning WiFi...");
   wifi_scan_config_t scan_config = {};
@@ -379,7 +381,7 @@ static httpd_handle_t start_http_server() {
 
 static void start_ap_mode() {
   ESP_LOGW(TAG, "WiFi 连接失败，进入AP模式");
-  nvs_clear_wifi();
+  ESP_LOGW(TAG, "保留当前NVS中的WiFi配置，不自动清空凭据");
 
   if (!s_ap_netif_created) {
     esp_netif_create_default_wifi_ap();
@@ -407,22 +409,78 @@ static void start_ap_mode() {
   }
 }
 
+static const char* wifi_disconnect_reason_to_str(uint8_t reason) {
+  switch (reason) {
+    case WIFI_REASON_NO_AP_FOUND: return "NO_AP_FOUND";
+    case WIFI_REASON_AUTH_FAIL: return "AUTH_FAIL";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: return "4WAY_HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT: return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_BEACON_TIMEOUT: return "BEACON_TIMEOUT";
+    case WIFI_REASON_ASSOC_FAIL: return "ASSOC_FAIL";
+    case WIFI_REASON_CONNECTION_FAIL: return "CONNECTION_FAIL";
+    case WIFI_REASON_ROAMING: return "ROAMING";
+    default: return "UNKNOWN";
+  }
+}
+
+static bool is_auth_failure_reason(uint8_t reason) {
+  switch (reason) {
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool is_no_ap_reason(uint8_t reason) {
+  return reason == WIFI_REASON_NO_AP_FOUND;
+}
+
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    if (s_retry_num < 20) {
-      esp_wifi_connect();
-      s_retry_num++;
-      ESP_LOGW(TAG, "重连WiFi中... (%d)", s_retry_num);
-    } else {
+    wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*)event_data;
+    uint8_t reason = event ? event->reason : 0xFF;
+    bool auth_fail = is_auth_failure_reason(reason);
+    bool no_ap = is_no_ap_reason(reason);
+
+    s_retry_num++;
+    s_retry_auth_fail = auth_fail ? (s_retry_auth_fail + 1) : 0;
+    s_retry_no_ap = no_ap ? (s_retry_no_ap + 1) : 0;
+
+    ESP_LOGW(TAG,
+             "WiFi断开: reason=%u(%s), total_retry=%d, auth_retry=%d, no_ap_retry=%d",
+             reason,
+             wifi_disconnect_reason_to_str(reason),
+             s_retry_num,
+             s_retry_auth_fail,
+             s_retry_no_ap);
+
+    if (s_retry_num >= WIFI_MAX_RETRY_TOTAL ||
+        s_retry_auth_fail >= WIFI_MAX_RETRY_AUTH_FAIL ||
+        s_retry_no_ap >= WIFI_MAX_RETRY_NO_AP) {
+      ESP_LOGE(TAG, "WiFi重连达到上限，设置失败位并进入AP配网模式");
       xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+      return;
+    }
+
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "esp_wifi_connect失败: %s", esp_err_to_name(err));
     }
   } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
     ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
     ESP_LOGI(TAG, "WiFi 连接成功, IP: " IPSTR, IP2STR(&event->ip_info.ip));
     s_retry_num = 0;
+    s_retry_auth_fail = 0;
+    s_retry_no_ap = 0;
     xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    ESP_LOGW(TAG, "IP丢失，等待重新获取");
   }
 }
 
@@ -437,13 +495,15 @@ static void wifi_init_sta(const char* ssid, const char* pass) {
 
   ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
   ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+  ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &wifi_event_handler, NULL));
 
   wifi_config_t wifi_config = {};
   safe_strcpy((char*)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), ssid);
   safe_strcpy((char*)wifi_config.sta.password, sizeof(wifi_config.sta.password), pass);
   wifi_config.sta.pmf_cfg.capable = true;
   wifi_config.sta.pmf_cfg.required = false;
-  wifi_config.sta.threshold.authmode = (strlen(pass) == 0) ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+  wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+  wifi_config.sta.failure_retry_cnt = 10;
 
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
@@ -459,7 +519,7 @@ static void wifi_init_sta(const char* ssid, const char* pass) {
       WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
       pdFALSE,
       pdFALSE,
-      pdMS_TO_TICKS(20000));
+      pdMS_TO_TICKS(WIFI_CONNECT_WAIT_MS));
 
   if (bits & WIFI_CONNECTED_BIT) {
     ESP_LOGI(TAG, "WiFi 已连接");
@@ -485,24 +545,27 @@ static void handle_servo_control(cJSON* obj) {
 static void try_pick_target_id_from_list(cJSON* arr) {
   if (!cJSON_IsArray(arr)) return;
 
-  // 1) 优先按配置名精确匹配
   cJSON* item = NULL;
-  cJSON_ArrayForEach(item, arr) {
-    cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
-    cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
-    const char* name_str = cJSON_IsString(name) ? name->valuestring : "";
-    const char* id_str = cJSON_IsString(id) ? id->valuestring : "";
-    if (!id_str || !*id_str) continue;
-    if (strcmp(name_str, TARGET_NAME) == 0) {
-      if (strcmp(ws_target_id, id_str) != 0) {
-        safe_strcpy(ws_target_id, sizeof(ws_target_id), id_str);
-        ESP_LOGI(TAG, "绑定目标 %s, id=%s", TARGET_NAME, ws_target_id);
+  if (has_preferred_target_name()) {
+    // 1) 配置了偏好目标名时，先尝试按名称精确匹配
+    cJSON_ArrayForEach(item, arr) {
+      cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
+      cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
+      const char* name_str = cJSON_IsString(name) ? name->valuestring : "";
+      const char* id_str = cJSON_IsString(id) ? id->valuestring : "";
+      if (!id_str || !*id_str) continue;
+      if (ws_self_id[0] != '\0' && strcmp(id_str, ws_self_id) == 0) continue;
+      if (strcmp(name_str, PREFERRED_TARGET_NAME) == 0) {
+        if (strcmp(ws_target_id, id_str) != 0) {
+          safe_strcpy(ws_target_id, sizeof(ws_target_id), id_str);
+          ESP_LOGI(TAG, "按偏好名绑定目标 %s, id=%s", PREFERRED_TARGET_NAME, ws_target_id);
+        }
+        return;
       }
-      return;
     }
   }
 
-  // 2) 找不到配置名时，兜底绑定首个非本机在线设备
+  // 2) 自动绑定首个非本机在线设备（不限制名称）
   const char* fallback_name = NULL;
   const char* fallback_id = NULL;
   cJSON_ArrayForEach(item, arr) {
@@ -511,7 +574,8 @@ static void try_pick_target_id_from_list(cJSON* arr) {
     const char* name_str = cJSON_IsString(name) ? name->valuestring : "";
     const char* id_str = cJSON_IsString(id) ? id->valuestring : "";
     if (!id_str || !*id_str) continue;
-    if (strcmp(name_str, g_board_name) == 0) continue;
+    if (ws_self_id[0] != '\0' && strcmp(id_str, ws_self_id) == 0) continue;
+    if (ws_self_id[0] == '\0' && strcmp(name_str, g_board_name) == 0) continue;
 
     fallback_name = name_str;
     fallback_id = id_str;
@@ -521,12 +585,23 @@ static void try_pick_target_id_from_list(cJSON* arr) {
   if (fallback_id && *fallback_id) {
     if (strcmp(ws_target_id, fallback_id) != 0) {
       safe_strcpy(ws_target_id, sizeof(ws_target_id), fallback_id);
-      ESP_LOGW(TAG, "未找到目标名 %s, 回退绑定 %s, id=%s", TARGET_NAME, fallback_name ? fallback_name : "", ws_target_id);
+      if (has_preferred_target_name()) {
+        ESP_LOGW(TAG, "未找到偏好目标名 %s，回退绑定 %s, id=%s",
+                 PREFERRED_TARGET_NAME,
+                 fallback_name ? fallback_name : "",
+                 ws_target_id);
+      } else {
+        ESP_LOGI(TAG, "自动绑定目标 %s, id=%s", fallback_name ? fallback_name : "", ws_target_id);
+      }
     }
     return;
   }
 
-  ESP_LOGW(TAG, "在线列表里没有可绑定目标(目标名=%s, 本机名=%s)", TARGET_NAME, g_board_name);
+  if (has_preferred_target_name()) {
+    ESP_LOGW(TAG, "在线列表里没有可绑定目标(偏好名=%s, 本机名=%s)", PREFERRED_TARGET_NAME, g_board_name);
+  } else {
+    ESP_LOGW(TAG, "在线列表里没有可绑定目标(本机名=%s)", g_board_name);
+  }
 }
 
 static void handle_message(const char* message) {
@@ -549,6 +624,15 @@ static void handle_message(const char* message) {
   }
 
   if (strcmp(type_str, "connected") == 0 || strcmp(type_str, "presence") == 0) {
+    if (strcmp(type_str, "connected") == 0) {
+      cJSON* clientId = cJSON_GetObjectItemCaseSensitive(doc, "clientId");
+      const char* self_id = cJSON_IsString(clientId) ? clientId->valuestring : "";
+      if (self_id && *self_id && strcmp(ws_self_id, self_id) != 0) {
+        safe_strcpy(ws_self_id, sizeof(ws_self_id), self_id);
+        ESP_LOGI(TAG, "记录本机clientId=%s", ws_self_id);
+      }
+    }
+
     cJSON* onlineClients = cJSON_GetObjectItemCaseSensitive(doc, "onlineClients");
     cJSON* onlineUsers = cJSON_GetObjectItemCaseSensitive(doc, "onlineUsers");
     if (onlineClients) try_pick_target_id_from_list(onlineClients);
@@ -744,7 +828,7 @@ static void app_task(void* arg) {
           }
         } else if (now_ms - last_wait_bind_log_ms >= WAIT_BIND_LOG_INTERVAL_MS) {
           last_wait_bind_log_ms = now_ms;
-          ESP_LOGI(TAG, "等待绑定: 尚未获取目标ID(name=%s), 跳过发送", TARGET_NAME);
+          ESP_LOGI(TAG, "等待绑定: 尚未获取目标ID, 跳过发送");
         }
       }
 
