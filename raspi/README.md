@@ -39,9 +39,7 @@ uv run bridge.py --config config.json --ws-uri ws://192.168.0.100:9102/ --client
 ## 4. ADC 到命令映射
 
 - ADC 到发送角 (`-90~90`) 的映射已在 ESP32 侧完成并通过 I2C 直接上报。
-- RasPi 侧仅做滤波/死区，再将发送角换算为舵机命令 `p`：
-  - `21~34`: `0~240deg -> p=0~1000`
-  - `35~43`: `0~270deg -> p=500~2500`
+- RasPi 侧仅做滤波/死区，`web_servo.position` 直接发送 `-90~90` 角度值。
 
 ## 5. WebSocket 发送格式
 

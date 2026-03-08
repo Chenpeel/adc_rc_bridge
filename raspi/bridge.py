@@ -24,9 +24,6 @@ except ImportError as exc:  # pragma: no cover
 SERVO_ID_MIN = 21
 SERVO_ID_MAX = 43
 SERVO_COUNT = SERVO_ID_MAX - SERVO_ID_MIN + 1
-SERVO_GROUP_A_MAX_ID = 34  # 21~34
-SERVO_GROUP_A_MAX_DEG = 240.0
-SERVO_GROUP_B_MAX_DEG = 270.0
 SEND_MIN_DEG = -90
 SEND_MAX_DEG = 90
 
@@ -414,7 +411,7 @@ class RaspiWsBridge:
                     "web_servo": {
                         "is_bus_servo": bool(self.cfg.ws_is_bus_servo),
                         "servo_id": sid,
-                        "position": send_deg_to_command(sid, pos),
+                        "position": clamp_int(int(pos), SEND_MIN_DEG, SEND_MAX_DEG),
                         "speed": speed,
                     },
                 }
@@ -455,30 +452,6 @@ def clamp_float(v: float, lo: float, hi: float) -> float:
     if v > hi:
         return hi
     return v
-
-
-def servo_max_deg(servo_id: int) -> float:
-    return SERVO_GROUP_A_MAX_DEG if servo_id <= SERVO_GROUP_A_MAX_ID else SERVO_GROUP_B_MAX_DEG
-
-
-def send_deg_to_servo_deg(servo_id: int, send_deg: float) -> float:
-    max_deg = servo_max_deg(servo_id)
-    reset_deg = max_deg * 0.5
-    clamped = clamp_float(send_deg, float(SEND_MIN_DEG), float(SEND_MAX_DEG))
-    return clamp_float(reset_deg + clamped * (reset_deg / 90.0), 0.0, max_deg)
-
-
-def send_deg_to_command(servo_id: int, send_deg: int) -> int:
-    max_deg = servo_max_deg(servo_id)
-    servo_deg = send_deg_to_servo_deg(servo_id, float(send_deg))
-    t = servo_deg / max_deg if max_deg > 0 else 0.0
-
-    if servo_id <= SERVO_GROUP_A_MAX_ID:
-        # 21~34: 0~240deg -> 0~1000
-        return clamp_int(int(round(1000.0 * t)), 0, 1000)
-
-    # 35~43: 0~270deg -> 500~2500
-    return clamp_int(int(round(500.0 + 2000.0 * t)), 500, 2500)
 
 
 def crc16_ccitt_false(data: bytes) -> int:
