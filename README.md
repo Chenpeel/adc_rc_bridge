@@ -221,6 +221,7 @@ idf.py app
 
 - WebSocket 地址：`ws_uri`
 - 本机注册名：`ws_client_name`
+- I2C 地址：`i2c_addr` 建议填 `40`（即 `0x28`）
 - 可选目标名：`ws_preferred_target_name`（空字符串表示不限制）
 - 发送周期：`send_interval_ms`
 - 抖动过滤：`filter_deadzone_deg`

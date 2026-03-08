@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+import errno
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
@@ -163,8 +164,32 @@ class RaspiWsBridge:
                     self.latest_seq = seq
                     self.latest_uptime_ms = uptime_ms
                     self.latest_angles = filtered
+            except OSError as exc:
+                if exc.errno == errno.EREMOTEIO:
+                    logging.warning(
+                        "I2C读取失败(Remote I/O): bus=%d addr=%d(0x%02x), 请检查i2c_addr是否匹配(0x28=40)",
+                        self.cfg.i2c_bus,
+                        self.cfg.i2c_addr,
+                        self.cfg.i2c_addr,
+                    )
+                else:
+                    logging.warning(
+                        "I2C读取失败: bus=%d addr=%d(0x%02x), err=%s",
+                        self.cfg.i2c_bus,
+                        self.cfg.i2c_addr,
+                        self.cfg.i2c_addr,
+                        exc,
+                    )
+                await asyncio.sleep(retry_interval)
+                continue
             except Exception as exc:
-                logging.warning("I2C读取失败: %s", exc)
+                logging.warning(
+                    "I2C读取失败: bus=%d addr=%d(0x%02x), err=%s",
+                    self.cfg.i2c_bus,
+                    self.cfg.i2c_addr,
+                    self.cfg.i2c_addr,
+                    exc,
+                )
                 await asyncio.sleep(retry_interval)
                 continue
 
@@ -410,6 +435,23 @@ def parse_adc_frame(frame: bytes) -> Optional[tuple[int, int, list[float]]]:
     return seq, uptime_ms, angles
 
 
+def parse_i2c_addr(value: Any) -> int:
+    if isinstance(value, int):
+        addr = value
+    elif isinstance(value, str):
+        text = value.strip().lower()
+        if text.startswith("0x"):
+            addr = int(text, 16)
+        else:
+            addr = int(text, 10)
+    else:
+        raise ValueError(f"不支持的i2c_addr类型: {type(value)}")
+
+    if not (0x08 <= addr <= 0x77):
+        raise ValueError(f"i2c_addr超出7-bit地址范围: {addr} (0x{addr:02x})")
+    return addr
+
+
 def load_config(path: Optional[str]) -> BridgeConfig:
     cfg = BridgeConfig()
     if not path:
@@ -421,7 +463,10 @@ def load_config(path: Optional[str]) -> BridgeConfig:
     allowed = set(asdict(cfg).keys())
     for k, v in raw.items():
         if k in allowed:
-            setattr(cfg, k, v)
+            if k == "i2c_addr":
+                setattr(cfg, k, parse_i2c_addr(v))
+            else:
+                setattr(cfg, k, v)
     return cfg
 
 
@@ -432,7 +477,13 @@ async def async_main(args: argparse.Namespace) -> None:
     if args.client_name:
         cfg.ws_client_name = args.client_name
 
-    logging.info("启动桥接: ws=%s i2c_bus=%d i2c_addr=0x%02x", cfg.ws_uri, cfg.i2c_bus, cfg.i2c_addr)
+    logging.info(
+        "启动桥接: ws=%s i2c_bus=%d i2c_addr=%d(0x%02x)",
+        cfg.ws_uri,
+        cfg.i2c_bus,
+        cfg.i2c_addr,
+        cfg.i2c_addr,
+    )
     bridge = RaspiWsBridge(cfg)
     await bridge.run()
 

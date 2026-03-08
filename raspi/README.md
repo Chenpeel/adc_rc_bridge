@@ -29,6 +29,7 @@ uv run bridge.py --config config.json --ws-uri ws://192.168.0.100:9102/ --client
 ## 3. I2C 协议
 
 - ESP32 从机地址: `0x28`
+- `config.json` 的 `i2c_addr` 推荐写 `40`（即 `0x28`），不要写 `28`
 - 主机请求命令: `0xA5`
 - 响应帧长度: `60 bytes`
 - 数据内容: `21~43` 共 `23` 路角度, 单位 `0.1 deg`
