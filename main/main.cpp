@@ -33,6 +33,7 @@ static const size_t I2C_SLAVE_TX_BUF_LEN = 256;
 // ====== 采样与任务配置 ======
 static const uint32_t ADC_CAPTURE_INTERVAL_MS = 15; // ~66Hz
 static const uint32_t I2C_CMD_WAIT_MS = 100;
+static const uint32_t ADC_DEBUG_LOG_INTERVAL_MS = 1000;
 
 // ====== 数据帧协议 ======
 // 帧格式(共60字节, 小端):
@@ -166,6 +167,7 @@ static esp_err_t init_i2c_slave() {
 static void adc_capture_task(void* arg) {
   uint16_t seq = 0;
   ServoSnapshot next = {};
+  uint32_t last_debug_log_ms = 0;
 
   while (true) {
     next.seq = ++seq;
@@ -180,6 +182,16 @@ static void adc_capture_task(void* arg) {
     if (xSemaphoreTake(s_snapshot_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
       s_latest_snapshot = next;
       xSemaphoreGive(s_snapshot_mutex);
+    }
+
+    if (next.uptime_ms - last_debug_log_ms >= ADC_DEBUG_LOG_INTERVAL_MS) {
+      last_debug_log_ms = next.uptime_ms;
+      ESP_LOGI(TAG,
+               "ADC seq=%u ch21=%.1f ch22=%.1f ch23=%.1f",
+               (unsigned)next.seq,
+               next.angles_x10[0] / 10.0f,
+               next.angles_x10[1] / 10.0f,
+               next.angles_x10[2] / 10.0f);
     }
 
     vTaskDelay(pdMS_TO_TICKS(ADC_CAPTURE_INTERVAL_MS));

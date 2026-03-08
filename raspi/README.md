@@ -38,7 +38,7 @@ uv run bridge.py --config config.json --ws-uri ws://192.168.0.100:9102/ --client
 
 1. `PermissionError: /dev/i2c-1`
    - 将用户加入 `i2c` 组，或使用 root 运行。
-2. `I2C帧CRC错误`
-   - 检查线序和地线，适当提高 `i2c_request_gap_ms`。
+2. `I2C帧CRC错误` / `I2C帧magic错误`
+   - 检查线序和地线，适当提高 `i2c_request_gap_ms`（如 `5 -> 10`）。
 3. `等待绑定`
    - 确认 WebSocket 服务端在线列表中存在非本机客户端。

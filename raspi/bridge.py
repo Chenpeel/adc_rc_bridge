@@ -36,7 +36,7 @@ CMD_GET_FRAME = 0xA5
 class BridgeConfig:
     i2c_bus: int = 1
     i2c_addr: int = 0x28
-    i2c_request_gap_ms: int = 2
+    i2c_request_gap_ms: int = 5
     i2c_poll_interval_ms: int = 20
     i2c_retry_delay_ms: int = 200
 
@@ -49,7 +49,7 @@ class BridgeConfig:
     send_interval_ms: int = 30
     send_min_delta_deg: int = 2
     send_batch_max: int = 8
-    send_max_batch_per_tick: int = 1
+    send_max_batch_per_tick: int = 3
 
     filter_alpha: float = 0.22
     filter_deadzone_deg: int = 5
@@ -135,6 +135,7 @@ class RaspiWsBridge:
         self.last_wait_bind_log = 0.0
         self.last_no_change_log = 0.0
         self.last_send_throttle_log = 0.0
+        self.last_send_ok_log = 0.0
 
     async def run(self) -> None:
         poll_task = asyncio.create_task(self.i2c_poll_loop(), name="i2c_poll")
@@ -243,6 +244,7 @@ class RaspiWsBridge:
             self.ws_target_id = ""
             self.need_full_sync = True
             self.last_sent_valid = [False] * SERVO_COUNT
+            self.last_sent_angles = [0] * SERVO_COUNT
         logging.info("WebSocket连接成功，等待绑定目标")
 
     async def send_register(self, ws: websockets.WebSocketClientProtocol) -> None:
@@ -335,11 +337,20 @@ class RaspiWsBridge:
         if not angles:
             return
 
-        delta_items: list[tuple[int, int]] = []
+        # 先收集“未同步成功”的通道，避免被前几个频繁变化通道长期挤占带宽
+        unsynced_items: list[tuple[int, int]] = []
+        changed_items: list[tuple[int, int]] = []
         for idx, angle in enumerate(angles):
+            sid = SERVO_ID_MIN + idx
+            if need_full_sync and (not self.last_sent_valid[idx]):
+                unsynced_items.append((sid, angle))
+                continue
+
             delta = abs(angle - self.last_sent_angles[idx])
-            if need_full_sync or (not self.last_sent_valid[idx]) or delta >= self.cfg.send_min_delta_deg:
-                delta_items.append((SERVO_ID_MIN + idx, angle))
+            if (not self.last_sent_valid[idx]) or delta >= self.cfg.send_min_delta_deg:
+                changed_items.append((sid, angle))
+
+        delta_items = unsynced_items + changed_items
 
         if not delta_items:
             if now - self.last_no_change_log >= 5.0:
@@ -368,9 +379,13 @@ class RaspiWsBridge:
                     self.last_sent_angles[idx] = pos
                     self.last_sent_valid[idx] = True
 
-            if self.need_full_sync and len(send_items) == len(delta_items):
+            if self.need_full_sync and all(self.last_sent_valid):
                 self.need_full_sync = False
                 logging.info("全量同步完成，切换增量发送")
+
+        if now - self.last_send_ok_log >= 1.0:
+            self.last_send_ok_log = now
+            logging.info("已发送: target=%s count=%d", target_id, len(send_items))
 
     async def ws_send_json(self, ws: websockets.WebSocketClientProtocol, obj: dict[str, Any]) -> None:
         await ws.send(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
