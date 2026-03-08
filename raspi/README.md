@@ -5,6 +5,7 @@
 - 从 ESP32(I2C 从机)读取 ADC 采样帧
 - 做滤波/死区/增量计算
 - 通过 WebSocket 转发为 `servo_control`
+- 默认启用较强抖动抑制（死区 + EMA + 连续确认帧）
 
 ## 1. 安装依赖
 
@@ -42,3 +43,5 @@ uv run bridge.py --config config.json --ws-uri ws://192.168.0.100:9102/ --client
    - 检查线序和地线，适当提高 `i2c_request_gap_ms`（如 `5 -> 10`）。
 3. `等待绑定`
    - 确认 WebSocket 服务端在线列表中存在非本机客户端。
+4. 抖动明显
+   - 增大 `filter_deadzone_deg`、`filter_confirm_frames`，并提高 `send_min_delta_deg`。

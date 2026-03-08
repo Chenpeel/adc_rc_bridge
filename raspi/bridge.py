@@ -47,23 +47,27 @@ class BridgeConfig:
     ws_heartbeat_interval_ms: int = 15000
 
     send_interval_ms: int = 30
-    send_min_delta_deg: int = 2
+    send_min_delta_deg: int = 4
     send_batch_max: int = 8
     send_max_batch_per_tick: int = 3
 
-    filter_alpha: float = 0.22
-    filter_deadzone_deg: int = 5
-    filter_max_step_per_tick: int = 6
+    filter_alpha: float = 0.16
+    filter_deadzone_deg: int = 10
+    filter_max_step_per_tick: int = 4
+    filter_confirm_frames: int = 2
 
 
 class ServoOutputFilter:
-    def __init__(self, alpha: float, deadzone: int, max_step: int, count: int) -> None:
+    def __init__(self, alpha: float, deadzone: int, max_step: int, confirm_frames: int, count: int) -> None:
         self.alpha = alpha
         self.deadzone = deadzone
         self.max_step = max_step
+        self.confirm_frames = max(1, confirm_frames)
         self.filtered = [0.0] * count
         self.stable = [0] * count
         self.inited = [False] * count
+        self.pending_dir = [0] * count
+        self.pending_count = [0] * count
 
     def apply(self, idx: int, raw_angle: float) -> int:
         if not self.inited[idx]:
@@ -79,7 +83,24 @@ class ServoOutputFilter:
         abs_delta = abs(delta)
 
         if abs_delta <= self.deadzone:
+            self.pending_dir[idx] = 0
+            self.pending_count[idx] = 0
             return self.stable[idx]
+
+        # 小幅变化要求连续多帧同向确认，降低ADC毛刺导致的舵机抖动
+        if self.confirm_frames > 1 and abs_delta < self.deadzone * 3:
+            direction = 1 if delta > 0 else -1
+            if self.pending_dir[idx] == direction:
+                self.pending_count[idx] += 1
+            else:
+                self.pending_dir[idx] = direction
+                self.pending_count[idx] = 1
+
+            if self.pending_count[idx] < self.confirm_frames:
+                return self.stable[idx]
+
+            self.pending_dir[idx] = 0
+            self.pending_count[idx] = 0
 
         if delta > self.max_step:
             delta = self.max_step
@@ -117,6 +138,7 @@ class RaspiWsBridge:
             alpha=cfg.filter_alpha,
             deadzone=cfg.filter_deadzone_deg,
             max_step=cfg.filter_max_step_per_tick,
+            confirm_frames=cfg.filter_confirm_frames,
             count=SERVO_COUNT,
         )
 

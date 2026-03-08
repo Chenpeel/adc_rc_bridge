@@ -10,10 +10,11 @@
   "ws_reconnect_delay_ms": 2000,
   "ws_heartbeat_interval_ms": 15000,
   "send_interval_ms": 30,
-  "send_min_delta_deg": 2,
+  "send_min_delta_deg": 4,
   "send_batch_max": 8,
   "send_max_batch_per_tick": 3,
-  "filter_alpha": 0.22,
-  "filter_deadzone_deg": 5,
-  "filter_max_step_per_tick": 6
+  "filter_alpha": 0.16,
+  "filter_deadzone_deg": 10,
+  "filter_max_step_per_tick": 4,
+  "filter_confirm_frames": 2
 }
