@@ -1,0 +1,18 @@
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raspi-bridge
+    init: true
+    network_mode: host
+    restart: unless-stopped
+    devices:
+      - /dev/i2c-1:/dev/i2c-1
+    volumes:
+      - ./config.json:/app/config.json:ro
+    command:
+      - python
+      - /app/bridge.py
+      - --config
+      - /app/config.json
