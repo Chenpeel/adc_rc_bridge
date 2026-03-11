@@ -121,20 +121,33 @@ static inline bool map_adc_code_to_send_deg(int adc_code, float* out_send_deg) {
   if (!out_send_deg) return false;
   int code = clampi(adc_code, 0, ADC_CODE_MAX);
 
-  // 仅保留以下有效区间并线性映射:
-  // 3071 -> 4095/0 -> 1023  对应  -90 -> 0 -> 90
-  // 其余(1024~3070)区间返回false，表示屏蔽更新
-  if (code >= ADC_BP3) {
-    float t = (float)(code - ADC_BP3) / (float)(ADC_BP4 - ADC_BP3); // 0 -> 1
-    *out_send_deg = SEND_MIN_DEG + t * (0.0f - SEND_MIN_DEG);       // -90 -> 0
-    return true;
-  }
+  // 周期折线映射(类似正弦的折线近似)，折点如下：
+  // 4095/0 -> 1023 -> 2047 -> 3071 -> 4095/0
+  //  0deg  -> 90deg->  0deg-> -90deg->  0deg
+  //
+  // 注意：这里不做“屏蔽区间”，0~4095 全区间都返回 true。
   if (code <= ADC_BP1) {
+    // 0 -> 1023 : 0 -> 90
     float t = (float)(code - ADC_BP0) / (float)(ADC_BP1 - ADC_BP0); // 0 -> 1
-    *out_send_deg = 0.0f + t * SEND_MAX_DEG;                         // 0 -> 90
+    *out_send_deg = 0.0f + t * SEND_MAX_DEG;
     return true;
   }
-  return false;
+  if (code <= ADC_BP2) {
+    // 1023 -> 2047 : 90 -> 0
+    float t = (float)(code - ADC_BP1) / (float)(ADC_BP2 - ADC_BP1); // 0 -> 1
+    *out_send_deg = SEND_MAX_DEG + t * (0.0f - SEND_MAX_DEG);
+    return true;
+  }
+  if (code <= ADC_BP3) {
+    // 2047 -> 3071 : 0 -> -90
+    float t = (float)(code - ADC_BP2) / (float)(ADC_BP3 - ADC_BP2); // 0 -> 1
+    *out_send_deg = 0.0f + t * SEND_MIN_DEG;
+    return true;
+  }
+  // 3071 -> 4095 : -90 -> 0
+  float t = (float)(code - ADC_BP3) / (float)(ADC_BP4 - ADC_BP3); // 0 -> 1
+  *out_send_deg = SEND_MIN_DEG + t * (0.0f - SEND_MIN_DEG);
+  return true;
 }
 
 static inline float send_deg_to_servo_deg(uint8_t servo_id, float send_deg) {
