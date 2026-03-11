@@ -22,14 +22,14 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit("缺少依赖 websockets，请先在 raspi 目录执行: uv sync --frozen") from exc
 
 SERVO_ID_MIN = 21
-SERVO_ID_MAX = 43
+SERVO_ID_MAX = 37
 SERVO_COUNT = SERVO_ID_MAX - SERVO_ID_MIN + 1
 SEND_MIN_DEG = -90
 SEND_MAX_DEG = 90
 
 FRAME_MAGIC = b"\xAA\x55"
 FRAME_VERSION = 2
-FRAME_SIZE = 60
+FRAME_SIZE = 48
 FRAME_HEADER_SIZE = 12
 CMD_GET_FRAME = 0xA5
 
