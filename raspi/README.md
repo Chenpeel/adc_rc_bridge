@@ -16,6 +16,18 @@ cp config.example.json config.json
 uv run bridge.py --config config.json
 ```
 
+如个别舵机方向与采样定义相反，可在 `config.json` 配置 `servo_reverse_map`
+对指定 `servo_id` 做角度取反（例如采样 -90deg 但实际要 +90deg）：
+
+```json
+{
+  "servo_reverse_map": {
+    "21": true,
+    "28": true
+  }
+}
+```
+
 可选覆盖参数：
 
 ```bash
@@ -30,6 +42,9 @@ uv run bridge.py --config config.json --ws-uri ws://192.168.0.100:9102/ --client
 cd raspi
 cp config.example.json config.json
 ```
+
+Docker Compose 启动时会读取当前目录下的 `config.json`
+（容器内路径为 `/config/config.json`），因此 `servo_reverse_map` 在容器内也会生效。
 
 ### 2.2 前台验证启动
 
@@ -86,4 +101,3 @@ sudo reboot
   }
 }
 ```
-

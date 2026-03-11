@@ -5,11 +5,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
-    "smbus2>=0.4.3" \
-    "websockets>=12.0"
+# 使用 uv + uv.lock 做依赖安装，保证版本可复现
+RUN pip install --no-cache-dir "uv"
+
+COPY pyproject.toml uv.lock /app/
+RUN uv sync --frozen
 
 COPY bridge.py /app/bridge.py
 COPY config.example.json /app/config.example.json
 
-CMD ["python", "/app/bridge.py", "--config", "/app/config.json"]
+CMD ["uv", "run", "python", "/app/bridge.py", "--config", "/app/config.json"]

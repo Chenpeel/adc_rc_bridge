@@ -19,5 +19,6 @@
   "filter_alpha": 0.16,
   "filter_deadzone_deg": 10,
   "filter_max_step_per_tick": 4,
-  "filter_confirm_frames": 2
+  "filter_confirm_frames": 2,
+  "servo_reverse_map": {}
 }

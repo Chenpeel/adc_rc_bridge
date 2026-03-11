@@ -7,19 +7,19 @@ import json
 import logging
 import time
 import errno
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
 try:
     from smbus2 import SMBus, i2c_msg
 except ImportError as exc:  # pragma: no cover
-    raise SystemExit("缺少依赖 smbus2，请先安装 requirements.txt") from exc
+    raise SystemExit("缺少依赖 smbus2，请先在 raspi 目录执行: uv sync --frozen") from exc
 
 try:
     import websockets
     from websockets.exceptions import ConnectionClosed
 except ImportError as exc:  # pragma: no cover
-    raise SystemExit("缺少依赖 websockets，请先安装 requirements.txt") from exc
+    raise SystemExit("缺少依赖 websockets，请先在 raspi 目录执行: uv sync --frozen") from exc
 
 SERVO_ID_MIN = 21
 SERVO_ID_MAX = 43
@@ -60,6 +60,10 @@ class BridgeConfig:
     filter_deadzone_deg: int = 10
     filter_max_step_per_tick: int = 4
     filter_confirm_frames: int = 2
+
+    # 舵机方向修正：当某些舵机安装/定义方向相反时，对该 id 的角度做取反。
+    # 例如采样得到 -90，但实际需要 +90，则将对应 servo_id 设置为 true。
+    servo_reverse_map: dict[int, bool] = field(default_factory=dict)
 
 
 class ServoOutputFilter:
@@ -160,6 +164,14 @@ class RaspiWsBridge:
             count=SERVO_COUNT,
         )
 
+        self.servo_reverse_mask = build_servo_reverse_mask(cfg.servo_reverse_map)
+        self.any_servo_reversed = any(self.servo_reverse_mask)
+        if self.any_servo_reversed:
+            reversed_ids = [
+                str(SERVO_ID_MIN + idx) for idx, reversed_ in enumerate(self.servo_reverse_mask) if reversed_
+            ]
+            logging.info("启用servo反向映射: ids=%s", ",".join(reversed_ids))
+
         self.latest_seq = 0
         self.latest_uptime_ms = 0
         self.latest_angles: Optional[list[int]] = None
@@ -198,6 +210,9 @@ class RaspiWsBridge:
                     continue
 
                 seq, uptime_ms, send_angles = parsed
+                # 方向修正应尽早应用，保证后续滤波、死区、增量判断在同一坐标系下工作。
+                if self.any_servo_reversed:
+                    send_angles = apply_servo_reverse_mask(send_angles, self.servo_reverse_mask)
                 filtered = [self.servo_filter.apply(i, send_angles[i]) for i in range(SERVO_COUNT)]
 
                 async with self.state_lock:
@@ -522,6 +537,80 @@ def parse_i2c_addr(value: Any) -> int:
     return addr
 
 
+def parse_servo_reverse_map(value: Any) -> dict[int, bool]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("servo_reverse_map必须是JSON对象(dict)，如 {\"21\": true}")
+
+    out: dict[int, bool] = {}
+    for raw_sid, raw_reverse in value.items():
+        sid: Optional[int] = None
+        if isinstance(raw_sid, int):
+            sid = raw_sid
+        elif isinstance(raw_sid, str):
+            text = raw_sid.strip()
+            if text:
+                try:
+                    sid = int(text, 10)
+                except ValueError:
+                    sid = None
+
+        if sid is None:
+            logging.warning("servo_reverse_map忽略非法servo_id键: %r", raw_sid)
+            continue
+
+        if not (SERVO_ID_MIN <= sid <= SERVO_ID_MAX):
+            logging.warning(
+                "servo_reverse_map忽略越界servo_id: %d (允许范围 %d~%d)",
+                sid,
+                SERVO_ID_MIN,
+                SERVO_ID_MAX,
+            )
+            continue
+
+        reverse: Optional[bool] = None
+        if isinstance(raw_reverse, bool):
+            reverse = raw_reverse
+        elif isinstance(raw_reverse, int) and raw_reverse in (0, 1):
+            reverse = bool(raw_reverse)
+        elif isinstance(raw_reverse, str):
+            t = raw_reverse.strip().lower()
+            if t in ("1", "true", "yes", "y", "on"):
+                reverse = True
+            elif t in ("0", "false", "no", "n", "off"):
+                reverse = False
+
+        if reverse is None:
+            logging.warning(
+                "servo_reverse_map忽略非法reverse值: servo_id=%d value=%r (支持 true/false 或 0/1)",
+                sid,
+                raw_reverse,
+            )
+            continue
+
+        out[sid] = reverse
+
+    return out
+
+
+def build_servo_reverse_mask(reverse_map: dict[int, bool]) -> list[bool]:
+    mask = [False] * SERVO_COUNT
+    for sid, reverse in reverse_map.items():
+        if not reverse:
+            continue
+        idx = sid - SERVO_ID_MIN
+        if 0 <= idx < SERVO_COUNT:
+            mask[idx] = True
+    return mask
+
+
+def apply_servo_reverse_mask(angles: list[float], mask: list[bool]) -> list[float]:
+    if len(angles) != len(mask):
+        return angles
+    return [(-angle if mask[idx] else angle) for idx, angle in enumerate(angles)]
+
+
 def load_config(path: Optional[str]) -> BridgeConfig:
     cfg = BridgeConfig()
     if not path:
@@ -535,6 +624,8 @@ def load_config(path: Optional[str]) -> BridgeConfig:
         if k in allowed:
             if k == "i2c_addr":
                 setattr(cfg, k, parse_i2c_addr(v))
+            elif k == "servo_reverse_map":
+                setattr(cfg, k, parse_servo_reverse_map(v))
             else:
                 setattr(cfg, k, v)
     return cfg
