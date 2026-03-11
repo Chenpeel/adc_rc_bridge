@@ -19,9 +19,9 @@ static const char* TAG = "esp_bridge";
 
 // ====== ADC/舵机通道定义 ======
 static const uint8_t SERVO_ID_MIN = 21;
-static const uint8_t SERVO_ID_MAX = 43;
-static const size_t SERVO_ID_COUNT = SERVO_ID_MAX - SERVO_ID_MIN + 1; // 23路
-static_assert(SERVO_ID_COUNT == 23, "SERVO_ID_COUNT should be 23");
+static const uint8_t SERVO_ID_MAX = 37;
+static const size_t SERVO_ID_COUNT = SERVO_ID_MAX - SERVO_ID_MIN + 1; // 17路
+static_assert(SERVO_ID_COUNT == 17, "SERVO_ID_COUNT should be 17");
 
 // ====== I2C从机配置 ======
 static const i2c_port_t I2C_SLAVE_PORT = I2C_NUM_0;
@@ -49,32 +49,32 @@ static const int ADC_BP3 = 3071;
 static const int ADC_BP4 = 4095;
 // 每路归一化区间（原始ADC码值，0~4095）
 static const int ADC_NORM_MIN[SERVO_ID_COUNT] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static const int ADC_NORM_MAX[SERVO_ID_COUNT] = {
     4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095,
-    4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095};
+    4095, 4095, 4095, 4095, 4095};
 // 每路相位偏移（单位：ADC码值，正值=向更大码值方向平移，负值相反）
 static const int ADC_PHASE_OFFSET[SERVO_ID_COUNT] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-static const uint8_t DEBUG_SERVO_IDS[] = {21, 22, 23, 32, 33, 34, 35, 41, 42, 43};
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static const uint8_t DEBUG_SERVO_IDS[] = {21, 22, 23, 32, 33, 34, 35, 36, 37};
 static const size_t DEBUG_SERVO_ID_COUNT = sizeof(DEBUG_SERVO_IDS) / sizeof(DEBUG_SERVO_IDS[0]);
 
 // ====== 数据帧协议 ======
-// 帧格式(共60字节, 小端):
+// 帧格式(共48字节, 小端):
 // [0]   magic0      = 0xAA
 // [1]   magic1      = 0x55
 // [2]   version     = 2
-// [3]   channel_cnt = 23
+// [3]   channel_cnt = 17
 // [4:6] seq
 // [6:10]uptime_ms
 // [10]  servo_id_min=21
 // [11]  reserved    =0
-// [12:58] send_deg_x10[23] (int16, 单位0.1度, 范围-90.0~90.0)
-// [58:60] crc16_ccitt_false (对前58字节计算)
+// [12:46] send_deg_x10[17] (int16, 单位0.1度, 范围-90.0~90.0)
+// [46:48] crc16_ccitt_false (对前46字节计算)
 static const uint8_t FRAME_MAGIC0 = 0xAA;
 static const uint8_t FRAME_MAGIC1 = 0x55;
 static const uint8_t FRAME_VERSION = 2;
-static const size_t FRAME_SIZE = 60;
+static const size_t FRAME_SIZE = 48;
 static_assert(FRAME_SIZE == (12 + SERVO_ID_COUNT * 2 + 2), "unexpected frame size");
 
 struct ServoSnapshot {
