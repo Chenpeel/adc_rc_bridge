@@ -2,6 +2,13 @@
 
 本文档覆盖 `rpi-esp` 架构下的环境配置、编译、烧录与联调流程。
 
+> [!WARNING]
+> 由于 `ESP32` 的 Wi-Fi 模块稳定性较差，本项目已转用
+> [Raspi + ESP32](https://github.com/Chenpeel/adc_rc_bridge/tree/rpi-esp)
+> 模式。
+> 请优先参考该方案进行部署、烧录和调试，避免继续沿用当前纯
+> `ESP32` Wi-Fi 方案。
+
 ## 1. 工程概览
 
 目录：
@@ -153,9 +160,7 @@ idf.py build
 - `build/bootloader/bootloader.bin`
 - `build/partition_table/partition-table.bin`
 
-## 6. 烧录与串口监控
-
-### 6.1 查找串口
+### 5.1 查找串口
 
 - Linux:
 
@@ -169,7 +174,7 @@ ls /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
 Get-CimInstance Win32_SerialPort | Select-Object DeviceID,Description
 ```
 
-### 6.2 一键烧录并监控
+### 5.2 一键烧录并监控
 
 - Linux 示例：
 
