@@ -9,16 +9,24 @@
 ```text
 .
 ├── CMakeLists.txt
+├── idf_component.yml
 ├── main/
 │   ├── CMakeLists.txt
-│   ├── main.cpp
-│   ├── gain.h
-│   └── idf_component.yml
+│   ├── adc_mux_sampler.cpp
+│   ├── adc_mux_sampler.h
+│   ├── bridge_protocol.cpp
+│   ├── bridge_protocol.h
+│   ├── idf_component.yml
+│   └── main.cpp
 ├── raspi/
+│   ├── README.md
 │   ├── bridge.py
-│   ├── requirements.txt
+│   ├── compose.yaml
 │   ├── config.example.json
-│   └── README.md
+│   ├── Dockerfile
+│   ├── pyproject.toml
+│   ├── test_bridge_reverse.py
+│   └── uv.lock
 ├── sdkconfig.defaults
 └── dependencies.lock
 ```

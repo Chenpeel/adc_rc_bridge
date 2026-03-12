@@ -17,7 +17,7 @@ uv run bridge.py --config config.json
 ```
 
 如个别舵机方向与采样定义相反，可在 `config.json` 配置 `servo_reverse_map`
-对指定 `servo_id` 做角度取反（例如采样 -90deg 但实际要 +90deg）：
+对指定 `servo_id` 做角度取反（angle = -angle，例如采样 -90deg 但实际要 +90deg）：
 
 ```json
 {

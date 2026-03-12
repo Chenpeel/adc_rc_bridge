@@ -486,28 +486,47 @@ def parse_adc_frame(frame: bytes) -> Optional[tuple[int, int, list[float]]]:
         logging.warning("I2C帧长度不匹配: len=%d expect=%d", len(frame), FRAME_SIZE)
         return None
 
+    frame_head_hex = frame[:8].hex(" ")
+
     if frame[0:2] != FRAME_MAGIC:
-        logging.warning("I2C帧magic错误")
+        logging.warning("I2C帧magic错误: head=%s", frame_head_hex)
         return None
 
     version = frame[2]
     channel_count = frame[3]
     if version != FRAME_VERSION or channel_count != SERVO_COUNT:
-        logging.warning("I2C帧版本或通道数错误: ver=%d cnt=%d", version, channel_count)
+        logging.warning(
+            "I2C帧版本或通道数错误: ver=%d cnt=%d expect_ver=%d expect_cnt=%d head=%s",
+            version,
+            channel_count,
+            FRAME_VERSION,
+            SERVO_COUNT,
+            frame_head_hex,
+        )
         return None
 
     payload = frame[:-2]
     recv_crc = int.from_bytes(frame[-2:], "little")
     calc_crc = crc16_ccitt_false(payload)
     if recv_crc != calc_crc:
-        logging.warning("I2C帧CRC错误: recv=0x%04x calc=0x%04x", recv_crc, calc_crc)
+        logging.warning(
+            "I2C帧CRC错误: recv=0x%04x calc=0x%04x head=%s",
+            recv_crc,
+            calc_crc,
+            frame_head_hex,
+        )
         return None
 
     seq = int.from_bytes(frame[4:6], "little")
     uptime_ms = int.from_bytes(frame[6:10], "little")
     servo_id_min = frame[10]
     if servo_id_min != SERVO_ID_MIN:
-        logging.warning("I2C帧servo_id_min不匹配: %d", servo_id_min)
+        logging.warning(
+            "I2C帧servo_id_min不匹配: got=%d expect=%d head=%s",
+            servo_id_min,
+            SERVO_ID_MIN,
+            frame_head_hex,
+        )
         return None
 
     send_angles: list[float] = []

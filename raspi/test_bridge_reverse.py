@@ -25,11 +25,13 @@ class TestServoReverseMap(unittest.TestCase):
         self.assertTrue(mask[2])
 
     def test_apply_servo_reverse_mask(self) -> None:
-        angles = [-90.0, -45.0, 0.0, 30.0]
-        mask = [True, False, True, False]
+        # reverse 的语义必须是“取反”(angle = -angle)，不是 abs(angle)。
+        # 因此：当 angle 为正且 mask=True 时，必须翻转为负数。
+        angles = [-90.0, 45.0, 0.0, 30.0]
+        mask = [True, True, True, False]
         out = bridge.apply_servo_reverse_mask(angles, mask)
         self.assertEqual(out, [90.0, -45.0, 0.0, 30.0])
-        self.assertEqual(angles, [-90.0, -45.0, 0.0, 30.0])
+        self.assertEqual(angles, [-90.0, 45.0, 0.0, 30.0])
 
     def test_load_config_parses_servo_reverse_map(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -43,4 +45,3 @@ class TestServoReverseMap(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
