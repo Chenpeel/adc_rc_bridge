@@ -31,14 +31,12 @@ FRAME_MAGIC = b"\xAA\x55"
 FRAME_VERSION = 2
 FRAME_SIZE = 48
 FRAME_HEADER_SIZE = 12
-CMD_GET_FRAME = 0xA5
 
 
 @dataclass
 class BridgeConfig:
     i2c_bus: int = 1
     i2c_addr: int = 0x28
-    i2c_request_gap_ms: int = 5
     i2c_poll_interval_ms: int = 20
     i2c_retry_delay_ms: int = 200
 
@@ -132,16 +130,13 @@ class ServoOutputFilter:
 
 
 class Esp32I2CClient:
-    def __init__(self, bus_id: int, slave_addr: int, request_gap_ms: int) -> None:
+    def __init__(self, bus_id: int, slave_addr: int) -> None:
         self.bus = SMBus(bus_id)
         self.addr = slave_addr
-        self.request_gap_sec = max(0, request_gap_ms) / 1000.0
 
     def read_frame(self) -> bytes:
-        self.bus.write_byte(self.addr, CMD_GET_FRAME)
-        if self.request_gap_sec > 0:
-            time.sleep(self.request_gap_sec)
-
+        # 新版协议里不再需要先 write 命令再 read。
+        # 主机对从机地址直接发起固定长度 read；ESP 侧会在 master request 事件发生时回填一整帧。
         msg = i2c_msg.read(self.addr, FRAME_SIZE)
         self.bus.i2c_rdwr(msg)
         return bytes(msg)
@@ -153,7 +148,7 @@ class Esp32I2CClient:
 class RaspiWsBridge:
     def __init__(self, cfg: BridgeConfig) -> None:
         self.cfg = cfg
-        self.i2c_client = Esp32I2CClient(cfg.i2c_bus, cfg.i2c_addr, cfg.i2c_request_gap_ms)
+        self.i2c_client = Esp32I2CClient(cfg.i2c_bus, cfg.i2c_addr)
         self.servo_filter = ServoOutputFilter(
             alpha=cfg.filter_alpha,
             deadzone=cfg.filter_deadzone_deg,
@@ -187,8 +182,6 @@ class RaspiWsBridge:
         self.last_wait_bind_log = 0.0
         self.last_no_change_log = 0.0
         self.last_send_throttle_log = 0.0
-        self.i2c_frame_stream = bytearray()
-        self.last_i2c_resync_log = 0.0
 
     async def run(self) -> None:
         poll_task = asyncio.create_task(self.i2c_poll_loop(), name="i2c_poll")
@@ -206,27 +199,12 @@ class RaspiWsBridge:
         while True:
             try:
                 frame = await asyncio.to_thread(self.i2c_client.read_frame)
-                parsed_frame = _parse_adc_frame(frame, log_errors=False)
+                parsed_frame = parse_adc_frame(frame)
                 if parsed_frame is None:
-                    self.i2c_frame_stream.extend(frame)
-                    recovered = try_extract_adc_frame_from_stream(self.i2c_frame_stream)
-                    if recovered is None:
-                        logging.warning("I2C帧magic错误: head=%s", frame[:8].hex(" "))
-                        await asyncio.sleep(retry_interval)
-                        continue
+                    await asyncio.sleep(retry_interval)
+                    continue
 
-                    seq, uptime_ms, send_angles, stream_offset = recovered
-                    now = time.monotonic()
-                    if now - self.last_i2c_resync_log >= 1.0:
-                        self.last_i2c_resync_log = now
-                        logging.warning(
-                            "I2C帧发生错位，已重同步: stream_offset=%d raw_head=%s",
-                            stream_offset,
-                            frame[:8].hex(" "),
-                        )
-                else:
-                    self.i2c_frame_stream.clear()
-                    seq, uptime_ms, send_angles = parsed_frame
+                seq, uptime_ms, send_angles = parsed_frame
 
                 # 方向修正应尽早应用，保证后续滤波、死区、增量判断在同一坐标系下工作。
                 if self.any_servo_reversed:
@@ -564,43 +542,6 @@ def _parse_adc_frame(frame: bytes, *, log_errors: bool) -> Optional[tuple[int, i
 
 def parse_adc_frame(frame: bytes) -> Optional[tuple[int, int, list[float]]]:
     return _parse_adc_frame(frame, log_errors=True)
-
-
-def try_extract_adc_frame_from_stream(frame_stream: bytearray) -> Optional[tuple[int, int, list[float], int]]:
-    # 某些 I2C 从机实现会把 TX 缓冲表现成“连续字节流”，而不是天然按帧对齐。
-    # 这样主机每次 read(48) 拿到的窗口起点可能漂到旧帧中间，例如刚好从 send_deg_x10[0] 开始。
-    #
-    # 这里按“magic + 固定长度 + CRC”在缓存字节流里重新找帧边界。
-    # 一旦找到完整有效帧，就把它之前的杂字节和该帧本身一起从缓存中丢掉，避免重复解析。
-    stream_len = len(frame_stream)
-    if stream_len < FRAME_SIZE:
-        return None
-
-    for start_index in range(0, stream_len - 1):
-        if frame_stream[start_index : start_index + 2] != FRAME_MAGIC:
-            continue
-
-        end_index = start_index + FRAME_SIZE
-        if end_index > stream_len:
-            break
-
-        candidate = bytes(frame_stream[start_index:end_index])
-        parsed = _parse_adc_frame(candidate, log_errors=False)
-        if parsed is None:
-            continue
-
-        del frame_stream[:end_index]
-        seq, uptime_ms, send_angles = parsed
-        return seq, uptime_ms, send_angles, start_index
-
-    # 控制缓存上限，避免长期错帧时无限增长。
-    # 保留 2 帧窗口足够覆盖：
-    # - 一帧尾巴 + 下一帧完整内容
-    # - 或者头部 magic 只进来一部分、等下次 read 补齐
-    if len(frame_stream) > FRAME_SIZE * 2:
-        del frame_stream[:-FRAME_SIZE * 2]
-
-    return None
 
 
 def parse_i2c_addr(value: Any) -> int:

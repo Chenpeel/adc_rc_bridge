@@ -53,12 +53,6 @@ enum {
   BRIDGE_FRAME_HEADER_SIZE = 12,
 };
 
-// I2C 交互命令字。
-// 主机向从机写入该字节后，再读取固定 48 字节数据帧。
-enum {
-  BRIDGE_I2C_CMD_GET_FRAME = 0xA5,
-};
-
 // 字段偏移（用于抓包/断点对齐）。
 enum {
   BRIDGE_FRAME_OFFSET_MAGIC0 = 0,

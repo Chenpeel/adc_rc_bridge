@@ -1,11 +1,13 @@
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#include "driver/i2c.h"
+#include "driver/i2c_slave.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -17,24 +19,35 @@
 static const char *TAG = "esp_bridge";
 
 // ================================================================
-// 本文件实现 ESP32 端的“采样 -> 映射 -> 快照 -> I2C 从机回传”闭环：
+// 本文件实现 ESP32 端的“采样 -> 映射 -> 帧缓存 -> I2C 从机回传”闭环：
 //
 // 1) adc_capture_task:
 //    - 周期性读取 17 路逻辑通道（底层由 adc_mux_sampler 模块驱动 MUX + ADC oneshot）
 //    - 将 ADC 码值做归一化/相位偏移（方便每路标定）
 //    - 将处理后的码值映射成 send_deg（-90~90 度），并以 0.1 度单位量化成 int16
-//    - 更新全局快照 s_latest_snapshot（受 mutex 保护）
+//    - 直接构建最新 I2C 帧并缓存到 s_latest_i2c_frame（受 mutex 保护）
 //
-// 2) i2c_slave_task:
-//    - 作为 I2C 从机等待主机命令
-//    - 收到 0xA5 后用 bridge_protocol 模块把最新快照打包成固定 48 字节帧并写入 TX buffer
+// 2) i2c_slave_tx_task:
+//    - 使用 ESP-IDF 6.1 的新版 i2c slave driver
+//    - 主机一旦发起 read，请求回调 on_request 会通知该任务
+//    - 该任务把“当前最新的一整帧”写入 slave TX buffer，供这次 read 事务读取
+//
+// 关键设计变化：
+// - 不再使用 legacy driver/i2c.h 的 i2c_slave_write_buffer() ring buffer 语义
+// - 不再要求主机先 write 0xA5 再 read
+// - 主机现在只需要对从机地址直接 read 固定 48 字节
+//
+// 这样做的原因：
+// - 旧方案里“write命令 + sleep + read”的两段式时序会把事务边界拆开
+// - legacy slave TX buffer 更接近连续字节流，不是天然的 packet 边界
+// - 现场日志里出现 payload 开头和 0xFF 填充，正是这种错位/空读的典型表现
 //
 // Debug 建议（先看这里，再看具体注释）：
 // - 如果采样值抖动：优先调 adc_mux_sampler 的 settle_delay_us/discard_read_count/sample_count；其次调 ADC_CAPTURE_INTERVAL_MS
 // - 如果某一路永远不变：核对“servo_id -> servo_index -> logical_channel”是否与硬件通道对应
 // - 如果某一路方向反了：raspi/config.json 的 servo_reverse_map 表示“角度取反”，即 angle = -angle；
 //   它不是简单的“把 -90 和 +90 对调”，而是对整个区间做符号翻转（30 -> -30, -45 -> +45）
-// - 如果 I2C 读不到数据：先确认主机是否写入 0xA5，再发起 read；检查 SDA/SCL 上拉与地址 0x28
+// - 如果 I2C 读不到数据：优先确认主机是否对地址 0x28 直接发起 48 字节 read；再检查 SDA/SCL 上拉与地线
 // ================================================================
 
 // ====== ADC/舵机通道定义 ======
@@ -49,22 +62,22 @@ static const size_t SERVO_COUNT = (size_t)BRIDGE_CHANNEL_COUNT; // 17 路
 static_assert(SERVO_COUNT == (size_t)BRIDGE_CHANNEL_COUNT, "SERVO_COUNT mismatch");
 
 // ====== I2C从机配置 ======
-// I2C 交互约定（主机侧需要按这个时序来）：
-// 1) 主机向从机地址 0x28 写入单字节命令 0xA5
-// 2) 主机随后从同一地址读取 48 字节数据帧（BRIDGE_FRAME_SIZE）
-static const i2c_port_t I2C_SLAVE_PORT = I2C_NUM_0;
+// 新交互约定（主机侧需要按这个时序来）：
+// 1) 主机直接对从机地址 0x28 发起 read
+// 2) 一次读取固定 48 字节数据帧（BRIDGE_FRAME_SIZE）
+// 3) 从机在 master request 事件发生时，把“当前最新的一帧”推入 TX buffer
+static const i2c_port_num_t I2C_SLAVE_PORT = I2C_NUM_0;
 static const gpio_num_t I2C_SLAVE_SDA_IO = GPIO_NUM_21;
 static const gpio_num_t I2C_SLAVE_SCL_IO = GPIO_NUM_22;
-static const uint8_t I2C_SLAVE_ADDR = 0x28;
-static const uint8_t I2C_CMD_GET_FRAME = (uint8_t)BRIDGE_I2C_CMD_GET_FRAME;
-static const size_t I2C_SLAVE_RX_BUF_LEN = 128;
-static const size_t I2C_SLAVE_TX_BUF_LEN = 256;
+static const uint16_t I2C_SLAVE_ADDR = 0x28;
+static const uint32_t I2C_SLAVE_SEND_BUF_DEPTH = BRIDGE_FRAME_SIZE;
+static const uint32_t I2C_SLAVE_RECV_BUF_DEPTH = 16;
+static const int I2C_SLAVE_WRITE_TIMEOUT_MS = 50;
 
 // ====== 采样与任务配置 ======
 // 采样任务节拍。注意：这是 vTaskDelay 的延时参数，不包含采样本身耗时；
 // 实际周期 ~= 采样耗时 + ADC_CAPTURE_INTERVAL_MS。
 static const uint32_t ADC_CAPTURE_INTERVAL_MS = 15; // ~66Hz
-static const uint32_t I2C_CMD_WAIT_MS = 100;
 static const uint32_t ADC_DEBUG_LOG_INTERVAL_MS = 1000;
 static const float SEND_MIN_DEG = -90.0f;
 static const float SEND_MAX_DEG = 90.0f;
@@ -103,11 +116,16 @@ static const size_t DEBUG_SERVO_ID_COUNT = sizeof(DEBUG_SERVO_IDS) / sizeof(DEBU
 // - bridge_protocol.cpp
 static_assert(BRIDGE_FRAME_SIZE == 48, "unexpected frame size");
 
-static bridge_snapshot_t s_latest_snapshot;
-static SemaphoreHandle_t s_snapshot_mutex = nullptr;
+static uint8_t s_latest_i2c_frame[BRIDGE_FRAME_SIZE] = {0};
+static size_t s_latest_i2c_frame_len = 0;
+static SemaphoreHandle_t s_i2c_frame_mutex = nullptr;
 
 // 采样硬件模块句柄（只在采样任务里使用）。
 static adc_mux_sampler_t s_adc_sampler;
+
+// 新版 I2C slave driver 句柄与“主机读请求”通知目标任务。
+static i2c_slave_dev_handle_t s_i2c_slave_handle = nullptr;
+static TaskHandle_t s_i2c_slave_tx_task_handle = nullptr;
 
 static inline int clamp_int(int value, int min_value, int max_value)
 {
@@ -194,83 +212,109 @@ static inline bool map_circle_angle_to_send_deg(int adc_phase_code, float *out_s
   return true;
 }
 
-static bool copy_latest_snapshot(bridge_snapshot_t *out_snapshot)
+static bool copy_latest_i2c_frame(uint8_t *out_frame, size_t out_capacity, size_t *out_len)
 {
-  // 复制最新快照（短临界区）。
-  // 这里锁的时间非常短：只做结构体拷贝，避免阻塞采样任务或 I2C 任务太久。
-  if (!out_snapshot || !s_snapshot_mutex)
+  // 复制“最近一次采样生成的完整 I2C 帧”。
+  // 这里锁的时间非常短：只做固定 48 字节 memcpy，避免阻塞采样任务或 I2C 发送任务太久。
+  if (!out_frame || out_capacity < BRIDGE_FRAME_SIZE || !out_len || !s_i2c_frame_mutex)
     return false;
-  if (xSemaphoreTake(s_snapshot_mutex, pdMS_TO_TICKS(5)) != pdTRUE)
+  // 这是主机 read 的关键路径。若这里拿锁失败，本次事务就可能读到空数据。
+  // 由于发布路径只做 48 字节 memcpy，临界区极短，因此这里直接等待锁最稳妥。
+  if (xSemaphoreTake(s_i2c_frame_mutex, portMAX_DELAY) != pdTRUE)
   {
     return false;
   }
-  *out_snapshot = s_latest_snapshot;
-  xSemaphoreGive(s_snapshot_mutex);
+  memcpy(out_frame, s_latest_i2c_frame, BRIDGE_FRAME_SIZE);
+  *out_len = s_latest_i2c_frame_len;
+  xSemaphoreGive(s_i2c_frame_mutex);
+  return (*out_len == BRIDGE_FRAME_SIZE);
+}
+
+static bool publish_latest_i2c_frame(const bridge_snapshot_t *snapshot)
+{
+  if (!snapshot || !s_i2c_frame_mutex)
+    return false;
+
+  uint8_t next_frame[BRIDGE_FRAME_SIZE] = {0};
+  size_t next_frame_len = 0;
+  const esp_err_t build_err =
+      bridge_build_frame(snapshot, next_frame, sizeof(next_frame), &next_frame_len);
+  if (build_err != ESP_OK || next_frame_len != BRIDGE_FRAME_SIZE)
+  {
+    ESP_LOGW(TAG,
+             "build frame failed: err=%s len=%u seq=%u",
+             esp_err_to_name(build_err),
+             (unsigned)next_frame_len,
+             (unsigned)snapshot->seq);
+    return false;
+  }
+
+  if (xSemaphoreTake(s_i2c_frame_mutex, portMAX_DELAY) != pdTRUE)
+  {
+    return false;
+  }
+  memcpy(s_latest_i2c_frame, next_frame, BRIDGE_FRAME_SIZE);
+  s_latest_i2c_frame_len = next_frame_len;
+  xSemaphoreGive(s_i2c_frame_mutex);
   return true;
 }
 
-static void reset_i2c_slave_fifos()
+static bool IRAM_ATTR on_i2c_slave_request(i2c_slave_dev_handle_t i2c_slave,
+                                           const i2c_slave_request_event_data_t *event_data,
+                                           void *user_ctx)
 {
-  // legacy I2C 从机驱动内部同时有硬件 FIFO 和软件 ring buffer。
-  // 如果主机轮询比从机处理更快、或者上一次读事务没有按预期消费完整帧，
-  // 旧数据可能残留在 TX/RX 缓冲里，下一次再写 48 字节就会出现“帧拼接”：
-  //   [旧帧尾][新帧头]
-  // 树莓派侧看起来就会表现为 magic/version 偶发错误，且日志常呈现周期性抖动。
-  //
-  // 因此这里在每次处理 GET_FRAME 命令前主动清 FIFO，确保：
-  // - TX 里只保留“本次命令对应的一帧”
-  // - RX 里不残留历史命令字节
-  const esp_err_t tx_reset_err = i2c_reset_tx_fifo(I2C_SLAVE_PORT);
-  if (tx_reset_err != ESP_OK)
-  {
-    ESP_LOGW(TAG, "i2c_reset_tx_fifo failed: %s", esp_err_to_name(tx_reset_err));
-  }
+  (void)i2c_slave;
+  (void)event_data;
+  (void)user_ctx;
 
-  const esp_err_t rx_reset_err = i2c_reset_rx_fifo(I2C_SLAVE_PORT);
-  if (rx_reset_err != ESP_OK)
+  BaseType_t task_woken = pdFALSE;
+  if (s_i2c_slave_tx_task_handle)
   {
-    ESP_LOGW(TAG, "i2c_reset_rx_fifo failed: %s", esp_err_to_name(rx_reset_err));
+    vTaskNotifyGiveFromISR(s_i2c_slave_tx_task_handle, &task_woken);
   }
+  return (task_woken == pdTRUE);
 }
 
 static esp_err_t init_i2c_slave()
 {
-  // 初始化 I2C 从机。
-  // Debug：
-  // - 如果主机扫不到地址：优先检查 SDA/SCL 是否接反、是否有上拉、GPIO 是否与硬件一致
-  // - 如果通信偶发错误：检查线长/上拉电阻/地线；必要时降低主机时钟
-  i2c_config_t i2c_cfg = {};
-  i2c_cfg.mode = I2C_MODE_SLAVE;
-  i2c_cfg.sda_io_num = I2C_SLAVE_SDA_IO;
-  i2c_cfg.scl_io_num = I2C_SLAVE_SCL_IO;
-  i2c_cfg.sda_pullup_en = GPIO_PULLUP_ENABLE;
-  i2c_cfg.scl_pullup_en = GPIO_PULLUP_ENABLE;
-  i2c_cfg.slave.addr_10bit_en = 0;
-  i2c_cfg.slave.slave_addr = I2C_SLAVE_ADDR;
+  // 使用 ESP-IDF 6.1 的新版 slave driver：
+  // - 主机发起 read 时触发 on_request 回调
+  // - 回调只负责唤醒任务，不做重活
+  // - 真正的帧发送在任务上下文里调用 i2c_slave_write 完成
+  i2c_slave_config_t i2c_slave_config = {};
+  i2c_slave_config.i2c_port = I2C_SLAVE_PORT;
+  i2c_slave_config.sda_io_num = I2C_SLAVE_SDA_IO;
+  i2c_slave_config.scl_io_num = I2C_SLAVE_SCL_IO;
+  i2c_slave_config.clk_source = I2C_CLK_SRC_DEFAULT;
+  i2c_slave_config.send_buf_depth = I2C_SLAVE_SEND_BUF_DEPTH;
+  i2c_slave_config.receive_buf_depth = I2C_SLAVE_RECV_BUF_DEPTH;
+  i2c_slave_config.slave_addr = I2C_SLAVE_ADDR;
+  i2c_slave_config.addr_bit_len = I2C_ADDR_BIT_LEN_7;
+  i2c_slave_config.intr_priority = 0;
+  i2c_slave_config.flags.enable_internal_pullup = 1;
 
-  esp_err_t err = i2c_param_config(I2C_SLAVE_PORT, &i2c_cfg);
+  esp_err_t err = i2c_new_slave_device(&i2c_slave_config, &s_i2c_slave_handle);
   if (err != ESP_OK)
   {
-    ESP_LOGE(TAG, "i2c_param_config failed: %s", esp_err_to_name(err));
+    ESP_LOGE(TAG, "i2c_new_slave_device failed: %s", esp_err_to_name(err));
     return err;
   }
 
-  err = i2c_driver_install(I2C_SLAVE_PORT,
-                           i2c_cfg.mode,
-                           (int)I2C_SLAVE_RX_BUF_LEN,
-                           (int)I2C_SLAVE_TX_BUF_LEN,
-                           0);
+  i2c_slave_event_callbacks_t callbacks = {};
+  callbacks.on_request = on_i2c_slave_request;
+  err = i2c_slave_register_event_callbacks(s_i2c_slave_handle, &callbacks, nullptr);
   if (err != ESP_OK)
   {
-    ESP_LOGE(TAG, "i2c_driver_install failed: %s", esp_err_to_name(err));
+    ESP_LOGE(TAG, "i2c_slave_register_event_callbacks failed: %s", esp_err_to_name(err));
     return err;
   }
 
   ESP_LOGI(TAG,
-           "I2C slave ready: addr=0x%02X, SDA=%d, SCL=%d",
-           I2C_SLAVE_ADDR,
+           "I2C slave ready: addr=0x%02X, SDA=%d, SCL=%d, frame_size=%u",
+           (unsigned)I2C_SLAVE_ADDR,
            (int)I2C_SLAVE_SDA_IO,
-           (int)I2C_SLAVE_SCL_IO);
+           (int)I2C_SLAVE_SCL_IO,
+           (unsigned)BRIDGE_FRAME_SIZE);
   return ESP_OK;
 }
 
@@ -278,7 +322,7 @@ static void adc_capture_task(void *arg)
 {
   (void)arg;
 
-  // 周期采样任务：把“物理采样值(ADC原始码值)”转换为“可发送的角度快照”。
+  // 周期采样任务：把“物理采样值(ADC原始码值)”转换为“可发送的角度快照”，并立即生成 I2C 帧缓存。
   //
   // 输出链路（每路）：
   // adc_mux_sampler_read_raw_code(servo_index) -> adc_raw_code(0~4095)
@@ -286,6 +330,7 @@ static void adc_capture_task(void *arg)
   //   -> wrap_adc_code(adc_normalized_code + ADC_PHASE_OFFSET_CODE[servo_index]) -> adc_phase_code(0~4095)
   //   -> map_circle_angle_to_send_deg(adc_phase_code) -> send_angle_deg(-90~90)
   //   -> send_deg_x10(int16) -> next_snapshot.send_deg_x10[servo_index]
+  //   -> bridge_build_frame(next_snapshot) -> s_latest_i2c_frame
   //
   // 设计点：
   // - 直接读取 ADC 原始码值，避免“角度 -> 码值 -> 角度”的来回转换与舍入误差
@@ -347,12 +392,8 @@ static void adc_capture_task(void *arg)
       next_snapshot.send_deg_x10[servo_index] = send_deg_x10;
     }
 
-    // 更新全局快照。拿不到锁就跳过本次更新（宁可丢一次更新，也不要长时间阻塞采样任务）。
-    if (xSemaphoreTake(s_snapshot_mutex, pdMS_TO_TICKS(5)) == pdTRUE)
-    {
-      s_latest_snapshot = next_snapshot;
-      xSemaphoreGive(s_snapshot_mutex);
-    }
+    // 采样任务直接发布“最新整帧”，这样 I2C 任务只负责发送，不再现场构帧。
+    (void)publish_latest_i2c_frame(&next_snapshot);
 
     if (next_snapshot.uptime_ms - last_debug_log_time_ms >= ADC_DEBUG_LOG_INTERVAL_MS)
     {
@@ -435,82 +476,58 @@ static void adc_capture_task(void *arg)
   }
 }
 
-static void i2c_slave_task(void *arg)
+static void i2c_slave_tx_task(void *arg)
 {
   (void)arg;
 
-  // I2C 从机服务任务：
-  // - RX：接收主机写入的命令字节（可以一次写多个字节，因此这里扫描 cmd_bytes）
-  // - TX：遇到命令 0xA5 时，构建最新数据帧并写入从机 TX buffer，等待主机读取
-  uint8_t cmd_bytes[16] = {0};
+  // I2C 从机发送任务：
+  // - on_request 回调只负责用 task notification 唤醒本任务
+  // - 本任务在正常任务上下文里复制“最新一整帧”并调用 i2c_slave_write
+  //
+  // 这样做的目的：
+  // - ISR 内不做 mutex / 构帧 / 日志等重操作
+  // - 每次主机 read 都只推送一帧，避免旧方案的 ring buffer 连续字节流错位
   uint8_t tx_frame[BRIDGE_FRAME_SIZE] = {0};
 
   while (true)
   {
-    const int rx_bytes = i2c_slave_read_buffer(
-        I2C_SLAVE_PORT,
-        cmd_bytes,
-        sizeof(cmd_bytes),
-        pdMS_TO_TICKS(I2C_CMD_WAIT_MS));
-
-    if (rx_bytes <= 0)
+    const uint32_t pending_request_count = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (pending_request_count == 0)
     {
-      continue;
-    }
-
-    bool has_get_frame_cmd = false;
-    for (int byte_index = 0; byte_index < rx_bytes; byte_index++)
-    {
-      if (cmd_bytes[byte_index] == I2C_CMD_GET_FRAME)
-      {
-        has_get_frame_cmd = true;
-        break;
-      }
-    }
-
-    if (!has_get_frame_cmd)
-    {
-      continue;
-    }
-
-    // 收到请求后先清掉历史残留，确保主机本次 read 读到的是“完整且唯一”的最新一帧。
-    reset_i2c_slave_fifos();
-
-    // 只在收到命令时才构建帧，避免空转浪费 CPU。
-    bridge_snapshot_t snapshot = {};
-    if (!copy_latest_snapshot(&snapshot))
-    {
-      ESP_LOGW(TAG, "snapshot not ready");
       continue;
     }
 
     size_t tx_frame_len = 0;
-    const esp_err_t frame_err =
-        bridge_build_frame(&snapshot, tx_frame, sizeof(tx_frame), &tx_frame_len);
-    if (frame_err != ESP_OK || tx_frame_len != BRIDGE_FRAME_SIZE)
+    if (!copy_latest_i2c_frame(tx_frame, sizeof(tx_frame), &tx_frame_len))
     {
-      ESP_LOGW(TAG,
-               "build frame failed: err=%s len=%u",
-               esp_err_to_name(frame_err),
-               (unsigned)tx_frame_len);
+      ESP_LOGW(TAG, "latest i2c frame not ready");
       continue;
     }
 
-    // i2c_slave_write_buffer 写入的是“从机内部 TX ring buffer”，不是直接发到总线上。
-    // 主机随后发起 read 时会从这里取数据。
-    const int tx_bytes = i2c_slave_write_buffer(
-        I2C_SLAVE_PORT,
-        tx_frame,
-        (int)tx_frame_len,
-        pdMS_TO_TICKS(20));
-
-    if (tx_bytes != (int)tx_frame_len)
+    uint32_t written_len = 0;
+    const esp_err_t write_err =
+        i2c_slave_write(s_i2c_slave_handle,
+                        tx_frame,
+                        (uint32_t)tx_frame_len,
+                        &written_len,
+                        I2C_SLAVE_WRITE_TIMEOUT_MS);
+    if (write_err != ESP_OK)
     {
       ESP_LOGW(TAG,
-               "i2c tx short write: tx=%d expect=%u seq=%u",
-               tx_bytes,
+               "i2c_slave_write failed: err=%s len=%u req=%u",
+               esp_err_to_name(write_err),
                (unsigned)tx_frame_len,
-               (unsigned)snapshot.seq);
+               (unsigned)pending_request_count);
+      continue;
+    }
+
+    if (written_len != tx_frame_len)
+    {
+      ESP_LOGW(TAG,
+               "i2c slave short write: tx=%u expect=%u req=%u",
+               (unsigned)written_len,
+               (unsigned)tx_frame_len,
+               (unsigned)pending_request_count);
     }
   }
 }
@@ -525,17 +542,25 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(nvs_flash_init());
   }
 
-  s_snapshot_mutex = xSemaphoreCreateMutex();
-  if (!s_snapshot_mutex)
+  s_i2c_frame_mutex = xSemaphoreCreateMutex();
+  if (!s_i2c_frame_mutex)
   {
-    ESP_LOGE(TAG, "create snapshot mutex failed");
+    ESP_LOGE(TAG, "create i2c frame mutex failed");
+    return;
+  }
+
+  // 先发布一帧全 0 快照，确保主机在采样任务启动前发起 read 时，也能拿到合法帧头和 CRC。
+  bridge_snapshot_t initial_snapshot = {};
+  if (!publish_latest_i2c_frame(&initial_snapshot))
+  {
+    ESP_LOGE(TAG, "publish initial i2c frame failed");
     return;
   }
 
   // 初始化采样硬件（GPIO + ADC oneshot）。
   // 若初始化失败，采样任务会一直读不到数据，直接在这里 fail-fast 更容易定位问题。
   adc_mux_sampler_config_t sampler_cfg = adc_mux_sampler_default_config();
-  esp_err_t sampler_err = adc_mux_sampler_init(&s_adc_sampler, &sampler_cfg);
+  const esp_err_t sampler_err = adc_mux_sampler_init(&s_adc_sampler, &sampler_cfg);
   if (sampler_err != ESP_OK)
   {
     ESP_LOGE(TAG, "adc sampler init failed: %s", esp_err_to_name(sampler_err));
@@ -548,7 +573,7 @@ extern "C" void app_main(void)
   }
 
   xTaskCreate(adc_capture_task, "adc_capture", 4096, nullptr, 5, nullptr);
-  xTaskCreate(i2c_slave_task, "i2c_slave", 4096, nullptr, 6, nullptr);
+  xTaskCreate(i2c_slave_tx_task, "i2c_slave_tx", 4096, nullptr, 6, &s_i2c_slave_tx_task_handle);
 
   ESP_LOGI(TAG,
            "ESP32 bridge started: adc_channels=%u, servo_id_range=%u-%u",

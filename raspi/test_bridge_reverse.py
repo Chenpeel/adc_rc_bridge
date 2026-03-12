@@ -63,20 +63,13 @@ class TestServoReverseMap(unittest.TestCase):
             cfg = bridge.load_config(path)
             self.assertEqual(cfg.servo_reverse_map, {21: True, 22: False})
 
-    def test_try_extract_adc_frame_from_stream_can_resync_misaligned_frame(self) -> None:
-        frame_a = build_test_frame(100, 123456, [10.0, 20.0, 30.0])
-        frame_b = build_test_frame(101, 123556, [84.8, 40.0, 36.6, -1.5])
+    def test_parse_adc_frame(self) -> None:
+        frame = build_test_frame(101, 123556, [84.8, 40.0, 36.6, -1.5])
+        parsed = bridge.parse_adc_frame(frame)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
 
-        # 模拟当前现场看到的错位模式：
-        # 本次 read 从上一帧 payload 偏移 12 处开始，后面接上下一帧的完整头。
-        frame_stream = bytearray(frame_a[bridge.FRAME_HEADER_SIZE :] + frame_b)
-
-        recovered = bridge.try_extract_adc_frame_from_stream(frame_stream)
-        self.assertIsNotNone(recovered)
-        assert recovered is not None
-
-        seq, uptime_ms, send_angles, stream_offset = recovered
-        self.assertEqual(stream_offset, bridge.FRAME_SIZE - bridge.FRAME_HEADER_SIZE)
+        seq, uptime_ms, send_angles = parsed
         self.assertEqual(seq, 101)
         self.assertEqual(uptime_ms, 123556)
         self.assertAlmostEqual(send_angles[0], 84.8)
