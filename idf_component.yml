@@ -1,2 +1,3 @@
-dependencies:
-  espressif/esp_websocket_client: "*"
+# 工程级组件依赖（Component Manager）。
+# 当前 ESP32 侧不使用 WebSocket，保持空依赖，避免引入无用组件。
+dependencies: {}

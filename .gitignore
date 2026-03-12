@@ -75,3 +75,8 @@ env/
 .DS_Store
 Thumbs.db
 ref
+
+# =========================
+# RasPi Bridge 本地配置
+# =========================
+raspi/config.json

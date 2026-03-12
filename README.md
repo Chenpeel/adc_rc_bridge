@@ -1,6 +1,6 @@
 # ADC_Remote_Control 
 
-本文档覆盖 Linux / Windows 双平台的环境配置、编译、烧录和排障流程。
+本文档覆盖 `rpi-esp` 架构下的环境配置、编译、烧录与联调流程。
 
 > [!WARNING]
 > 由于 `ESP32` 的 Wi-Fi 模块稳定性较差，本项目已转用
@@ -16,20 +16,33 @@
 ```text
 .
 ├── CMakeLists.txt
+├── idf_component.yml
 ├── main/
 │   ├── CMakeLists.txt
-│   ├── main.cpp
-│   ├── gain.h
-│   ├── send.h
-│   └── idf_component.yml
+│   ├── adc_mux_sampler.cpp
+│   ├── adc_mux_sampler.h
+│   ├── bridge_protocol.cpp
+│   ├── bridge_protocol.h
+│   ├── idf_component.yml
+│   └── main.cpp
+├── raspi/
+│   ├── README.md
+│   ├── bridge.py
+│   ├── compose.yaml
+│   ├── config.example.json
+│   ├── Dockerfile
+│   ├── pyproject.toml
+│   ├── test_bridge_reverse.py
+│   └── uv.lock
 ├── sdkconfig.defaults
 └── dependencies.lock
 ```
 
 关键点：
 
-- 使用 `main/idf_component.yml` 拉取第三方组件。
-- `dependencies.lock` 锁定依赖版本。默认目标是 `esp32`。
+- ESP32 负责 `ADC + I2C 从机`。
+- Raspberry Pi OS 负责 `I2C 主机读取 + WebSocket 通信`，参考[RasPi Bridge](./raspi/README.md)
+- 默认目标芯片为 `esp32`。
 
 ## 2. Linux 环境配置
 
@@ -110,8 +123,7 @@ git clone https://github.com/Chenpeel/adc_rc_bridge.git adc_rc_bridge
 cd adc_rc_bridge
 ```
 
-首次构建时，ESP-IDF 会根据 `main/idf_component.yml` 自动下载组件。  
-需要确保网络可访问 `components.espressif.com`。
+本分支不依赖额外三方 ESP-IDF 组件，离线构建更稳定。
 
 可选：显式指定组件缓存目录（在受限环境里很有用）：
 

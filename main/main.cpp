@@ -1,872 +1,582 @@
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-#include <inttypes.h>
-#include <utility>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 
-#include "esp_event.h"
+#include "driver/i2c_slave.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_wifi.h"
-#include "esp_netif.h"
-#include "nvs.h"
 #include "nvs_flash.h"
-#include "esp_http_server.h"
-#include "esp_websocket_client.h"
-#include "cJSON.h"
 
-#include "gain.h"
-#include "send.h"
+#include "adc_mux_sampler.h"
+#include "bridge_protocol.h"
 
-static const char* TAG = "app";
-static const char* PREFERRED_TARGET_NAME = ""; // 为空表示不限制目标名称，自动绑定第一个非本机客户端
-static const uint32_t SEND_INTERVAL_MS = 30; // ~33Hz, 更低控制延迟
-static const uint32_t WAIT_BIND_LOG_INTERVAL_MS = 3000; // 未绑定目标时日志限频
-static const uint32_t WAIT_WS_LOG_INTERVAL_MS = 3000; // WebSocket未连接时日志限频
-static const uint32_t NO_CHANGE_LOG_INTERVAL_MS = 5000; // 无变化时日志限频
-static const uint32_t SEND_THROTTLE_LOG_INTERVAL_MS = 3000; // 发送限流日志间隔
-static const float SERVO_FILTER_ALPHA = 0.22f; // EMA低通滤波系数(0~1, 越大越跟手)
-static const int SERVO_DEADZONE = 5; // 舵机死区(角度单位), 约5度抖动过滤
-static const int SERVO_MAX_STEP_PER_TICK = 6; // 每个发送周期允许的最大角度变化
-static const int SERVO_SEND_MIN_DELTA = 2; // 与上次发送相比最小变化量，小于该值不发
-static const bool ENABLE_SERVO_JUMP_FILTER = false; // 巨跳变过滤开关
-static const int SERVO_JUMP_REJECT_THRESHOLD = 14; // 判定为异常跳变的阈值(需大于死区)
-static const int SERVO_JUMP_CONFIRM_FRAMES = 6; // 大跳变需要连续确认帧数
-static const bool ENABLE_SERVER_CONTROL_MIRROR = false; // 是否同时发送server-c镜像格式
-static const int SERVO_SEND_BATCH_MAX = 8; // 每次最多发送的舵机条数，避免单包过大
-static const int SERVO_MAX_BATCH_PER_TICK = 1; // 每周期最多发送批次数，避免短时打爆socket
-static const int WS_RECONNECT_TIMEOUT_MS = 2000;
-static const int WS_NETWORK_TIMEOUT_MS = 15000;
-static const int WS_PINGPONG_TIMEOUT_SEC = 60;
-static const bool WS_DISABLE_PINGPONG_DISCON = true;
-static const bool WS_TCP_KEEPALIVE_ENABLE = true;
-static const int WS_TCP_KEEPALIVE_IDLE_SEC = 20;
-static const int WS_TCP_KEEPALIVE_INTERVAL_SEC = 5;
-static const int WS_TCP_KEEPALIVE_COUNT = 3;
-static const int SERVO_ID_MIN = 21;
-static const int SERVO_ID_MAX = 43;
-static const int SERVO_ID_COUNT = SERVO_ID_MAX - SERVO_ID_MIN + 1; // 23路(21~43)
-static_assert(SERVO_ID_COUNT > 0, "SERVO_ID_COUNT must be positive");
-static_assert(SERVO_ID_COUNT <= SEND_CHANNELS, "SERVO_ID_COUNT must not exceed ADC channels");
-static_assert(SERVO_MAX_STEP_PER_TICK > 0, "SERVO_MAX_STEP_PER_TICK must be positive");
-static_assert(SERVO_SEND_MIN_DELTA >= 1, "SERVO_SEND_MIN_DELTA must be >= 1");
-static_assert(SERVO_JUMP_REJECT_THRESHOLD > SERVO_DEADZONE, "jump reject threshold should exceed deadzone");
-static_assert(SERVO_JUMP_CONFIRM_FRAMES > 0, "jump confirm frames must be positive");
-static_assert(SERVO_SEND_BATCH_MAX > 0, "SERVO_SEND_BATCH_MAX must be positive");
-static_assert(SERVO_MAX_BATCH_PER_TICK > 0, "SERVO_MAX_BATCH_PER_TICK must be positive");
+static const char *TAG = "esp_bridge";
 
-static const char* DEFAULT_SSID = "gaoda";
-static const char* DEFAULT_PASS = "gaoda123";
-static const char* DEFAULT_NAME = "body";
-static const int WIFI_CONNECT_WAIT_MS = 45000;
-static const int WIFI_MAX_RETRY_TOTAL = 40;
-static const int WIFI_MAX_RETRY_AUTH_FAIL = 8;
-static const int WIFI_MAX_RETRY_NO_AP = 12;
+// ================================================================
+// 本文件实现 ESP32 端的“采样 -> 映射 -> 帧缓存 -> I2C 从机回传”闭环：
+//
+// 1) adc_capture_task:
+//    - 周期性读取 17 路逻辑通道（底层由 adc_mux_sampler 模块驱动 MUX + ADC oneshot）
+//    - 将 ADC 码值做归一化/相位偏移（方便每路标定）
+//    - 将处理后的码值映射成 send_deg（-90~90 度），并以 0.1 度单位量化成 int16
+//    - 直接构建最新 I2C 帧并缓存到 s_latest_i2c_frame（受 mutex 保护）
+//
+// 2) i2c_slave_tx_task:
+//    - 使用 ESP-IDF 6.1 的新版 i2c slave driver
+//    - 主机一旦发起 read，请求回调 on_request 会通知该任务
+//    - 该任务把“当前最新的一整帧”写入 slave TX buffer，供这次 read 事务读取
+//
+// 关键设计变化：
+// - 不再使用 legacy driver/i2c.h 的 i2c_slave_write_buffer() ring buffer 语义
+// - 不再要求主机先 write 0xA5 再 read
+// - 主机现在只需要对从机地址直接 read 固定 48 字节
+//
+// 这样做的原因：
+// - 旧方案里“write命令 + sleep + read”的两段式时序会把事务边界拆开
+// - legacy slave TX buffer 更接近连续字节流，不是天然的 packet 边界
+// - 现场日志里出现 payload 开头和 0xFF 填充，正是这种错位/空读的典型表现
+//
+// Debug 建议（先看这里，再看具体注释）：
+// - 如果采样值抖动：优先调 adc_mux_sampler 的 settle_delay_us/discard_read_count/sample_count；其次调 ADC_CAPTURE_INTERVAL_MS
+// - 如果某一路永远不变：核对“servo_id -> servo_index -> logical_channel”是否与硬件通道对应
+// - 如果某一路方向反了：raspi/config.json 的 servo_reverse_map 表示“角度取反”，即 angle = -angle；
+//   它不是简单的“把 -90 和 +90 对调”，而是对整个区间做符号翻转（30 -> -30, -45 -> +45）
+// - 如果 I2C 读不到数据：优先确认主机是否对地址 0x28 直接发起 48 字节 read；再检查 SDA/SCL 上拉与地线
+// ================================================================
 
-static EventGroupHandle_t s_wifi_event_group;
-static const int WIFI_CONNECTED_BIT = BIT0;
-static const int WIFI_FAIL_BIT = BIT1;
-static int s_retry_num = 0;
-static int s_retry_auth_fail = 0;
-static int s_retry_no_ap = 0;
+// ====== ADC/舵机通道定义 ======
+// 这里的“servo_id”是外部系统使用的舵机编号（21~37），而内部数组索引 idx 是 0~16。
+// - servo_id = SERVO_ID_MIN + idx
+// - 本工程将 idx 直接作为采样模块的 logical_channel：
+//   idx 0~15 -> MUX1 通道 0~15
+//   idx 16   -> MUX2 通道 0（logical_channel >= 16 时落到第二片 MUX）
+static const uint8_t SERVO_ID_MIN = (uint8_t)BRIDGE_SERVO_ID_MIN;
+static const uint8_t SERVO_ID_MAX = (uint8_t)BRIDGE_SERVO_ID_MAX;
+static const size_t SERVO_COUNT = (size_t)BRIDGE_CHANNEL_COUNT; // 17 路
+static_assert(SERVO_COUNT == (size_t)BRIDGE_CHANNEL_COUNT, "SERVO_COUNT mismatch");
 
-static bool g_send_as_servo_control = false;
+// ====== I2C从机配置 ======
+// 新交互约定（主机侧需要按这个时序来）：
+// 1) 主机直接对从机地址 0x28 发起 read
+// 2) 一次读取固定 48 字节数据帧（BRIDGE_FRAME_SIZE）
+// 3) 从机在 master request 事件发生时，把“当前最新的一帧”推入 TX buffer
+static const i2c_port_num_t I2C_SLAVE_PORT = I2C_NUM_0;
+static const gpio_num_t I2C_SLAVE_SDA_IO = GPIO_NUM_21;
+static const gpio_num_t I2C_SLAVE_SCL_IO = GPIO_NUM_22;
+static const uint16_t I2C_SLAVE_ADDR = 0x28;
+static const uint32_t I2C_SLAVE_SEND_BUF_DEPTH = BRIDGE_FRAME_SIZE;
+static const uint32_t I2C_SLAVE_RECV_BUF_DEPTH = 16;
+static const int I2C_SLAVE_WRITE_TIMEOUT_MS = 50;
 
-static char g_ssid[33] = {0};
-static char g_pass[65] = {0};
-static char g_board_name[32] = "body";
+// ====== 采样与任务配置 ======
+// 采样任务节拍。注意：这是 vTaskDelay 的延时参数，不包含采样本身耗时；
+// 实际周期 ~= 采样耗时 + ADC_CAPTURE_INTERVAL_MS。
+static const uint32_t ADC_CAPTURE_INTERVAL_MS = 15; // ~66Hz
+static const uint32_t ADC_DEBUG_LOG_INTERVAL_MS = 1000;
+static const float SEND_MIN_DEG = -90.0f;
+static const float SEND_MAX_DEG = 90.0f;
+static const int ADC_CODE_MAX = 4095;
+// “圆周角度”的分段断点（单位：deg）。这里只用作折线映射的分段依据。
+static const int CIRCLE_ANGLE_DEG_90 = 90;
+static const int CIRCLE_ANGLE_DEG_180 = 180;
+static const int CIRCLE_ANGLE_DEG_270 = 270;
+static const int CIRCLE_ANGLE_DEG_360 = 360;
+// 每路归一化区间（原始 ADC 码值，0~4095）
+//
+// 用途：
+// - 不同通道的传感器/分压可能导致“有效范围”并非完整 0~4095
+// - 这里允许你为每路指定一个 [min,max]，然后把它线性拉伸/压缩到 [0,4095]
+//
+// Debug：
+// - 如果某路输出总在两端饱和，优先检查该路的 ADC_CALIB_MIN_CODE/ADC_CALIB_MAX_CODE 是否设置合理
+static const int ADC_CALIB_MIN_CODE[SERVO_COUNT] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static const int ADC_CALIB_MAX_CODE[SERVO_COUNT] = {
+    4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095, 4095,
+    4095, 4095, 4095, 4095, 4095};
+// 每路相位偏移（单位：ADC码值，正值=向更大码值方向平移，负值相反）
+// 用途：
+// - 某些角度传感器是周期量（0/360 度等价），你可以用 phase offset 把“零位”对齐到期望位置
+// - wrap_adc_code 会把结果包回 0~4095，避免越界
+static const int ADC_PHASE_OFFSET_CODE[SERVO_COUNT] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+// 定期打印这些舵机的映射链路（原始/归一化/相位/最终角度），用于现场快速定位是哪一段出了问题。
+static const uint8_t DEBUG_SERVO_IDS[] = {21, 22, 23, 32, 33, 34, 35, 36, 37};
+static const size_t DEBUG_SERVO_ID_COUNT = sizeof(DEBUG_SERVO_IDS) / sizeof(DEBUG_SERVO_IDS[0]);
 
-// WebSocket globals used by send.h
-esp_websocket_client_handle_t ws_client = NULL;
-char ws_self_id[64] = {0};
-char ws_target_id[64] = {0};
+// ====== 数据帧协议 ======
+// 帧结构、字段偏移、CRC16 算法统一由 bridge_protocol 模块维护：
+// - bridge_protocol.h
+// - bridge_protocol.cpp
+static_assert(BRIDGE_FRAME_SIZE == 48, "unexpected frame size");
 
-static httpd_handle_t s_httpd = NULL;
-static bool s_ap_netif_created = false;
+static uint8_t s_latest_i2c_frame[BRIDGE_FRAME_SIZE] = {0};
+static size_t s_latest_i2c_frame_len = 0;
+static SemaphoreHandle_t s_i2c_frame_mutex = nullptr;
 
-static inline bool is_ws_connected() {
-  return (ws_client != NULL) && esp_websocket_client_is_connected(ws_client);
+// 采样硬件模块句柄（只在采样任务里使用）。
+static adc_mux_sampler_t s_adc_sampler;
+
+// 新版 I2C slave driver 句柄与“主机读请求”通知目标任务。
+static i2c_slave_dev_handle_t s_i2c_slave_handle = nullptr;
+static TaskHandle_t s_i2c_slave_tx_task_handle = nullptr;
+
+static inline int clamp_int(int value, int min_value, int max_value)
+{
+  if (value < min_value)
+    return min_value;
+  if (value > max_value)
+    return max_value;
+  return value;
 }
 
-static inline bool has_preferred_target_name() {
-  return PREFERRED_TARGET_NAME && PREFERRED_TARGET_NAME[0] != '\0';
+static inline int wrap_adc_code(int adc_code)
+{
+  // 将任意整数包回 [0, 4095]。
+  // 用途：相位偏移后可能出现负数或超过 4095，这里通过取模实现“周期量”的 wrap。
+  const int adc_code_range = ADC_CODE_MAX + 1;
+  int wrapped_code = adc_code % adc_code_range;
+  if (wrapped_code < 0)
+    wrapped_code += adc_code_range;
+  return wrapped_code;
 }
 
-struct ServoOutputFilter {
-  float filtered[SERVO_ID_COUNT] = {0.0f};
-  int stable[SERVO_ID_COUNT] = {0};
-  bool inited[SERVO_ID_COUNT] = {false};
-  int pending_dir[SERVO_ID_COUNT] = {0};
-  uint8_t pending_count[SERVO_ID_COUNT] = {0};
+static inline int normalize_adc_raw_code(size_t servo_index, int raw_adc_code)
+{
+  // 每路独立归一化：将 [ADC_CALIB_MIN_CODE[servo_index], ADC_CALIB_MAX_CODE[servo_index]] 映射到 [0,4095]。
+  //
+  // 关键点：
+  // - lo/hi 会被夹到合法范围，并保证 hi >= lo+1，避免除 0
+  // - raw_code 会先夹到 [lo,hi]，因此超出区间的值会在归一化后饱和到 0 或 4095
+  const int range_min_code = clamp_int(ADC_CALIB_MIN_CODE[servo_index], 0, ADC_CODE_MAX - 1);
+  const int range_max_code =
+      clamp_int(ADC_CALIB_MAX_CODE[servo_index], range_min_code + 1, ADC_CODE_MAX);
+  const int raw_code_clamped = clamp_int(raw_adc_code, range_min_code, range_max_code);
+  const int normalized_code =
+      (int)roundf((float)(raw_code_clamped - range_min_code) * (float)ADC_CODE_MAX /
+                  (float)(range_max_code - range_min_code));
+  return clamp_int(normalized_code, 0, ADC_CODE_MAX);
+}
 
-  bool confirm_large_delta(int idx, int delta) {
-    int dir = (delta > 0) ? 1 : -1;
-    if (pending_dir[idx] == dir) {
-      if (pending_count[idx] < 0xFF) pending_count[idx]++;
-    } else {
-      pending_dir[idx] = dir;
-      pending_count[idx] = 1;
-    }
+static inline bool map_circle_angle_to_send_deg(int adc_phase_code, float *out_send_deg)
+{
+  if (!out_send_deg)
+    return false;
 
-    if (pending_count[idx] < SERVO_JUMP_CONFIRM_FRAMES) {
-      return false;
-    }
+  // 这里的输入不是“机械角度”，而是一个周期量的相位表达：
+  // - adc_phase_code 是 0~4095 的环形码值（0 与 4095 在物理意义上相邻）
+  // - 后续会先线性换算为 circle_angle_deg（0~360），再进行折线映射
+  const int adc_phase_code_clamped = clamp_int(adc_phase_code, 0, ADC_CODE_MAX);
+  const float circle_angle_deg =
+      (float)adc_phase_code_clamped * (float)CIRCLE_ANGLE_DEG_360 / (float)ADC_CODE_MAX;
 
-    pending_dir[idx] = 0;
-    pending_count[idx] = 0;
+  // 周期折线映射(类似正弦的折线近似)，折点如下：
+  //  0deg  ->  90deg  ->  180deg  ->  270deg  ->  360deg
+  //  0deg  ->  90deg  ->  0deg    -> -90deg  ->  0deg
+  //
+  // 结果：输出在 -90~90 之间往返摆动（“圆周量 -> 往复量”）。
+  if (circle_angle_deg <= (float)CIRCLE_ANGLE_DEG_90)
+  {
+    // 0 -> 90 : 0 -> +90
+    const float t = circle_angle_deg / (float)CIRCLE_ANGLE_DEG_90;
+    *out_send_deg = 0.0f + t * SEND_MAX_DEG;
+    return true;
+  }
+  if (circle_angle_deg <= (float)CIRCLE_ANGLE_DEG_180)
+  {
+    // 90 -> 180 : +90 -> 0
+    const float t = (circle_angle_deg - (float)CIRCLE_ANGLE_DEG_90) /
+                    (float)(CIRCLE_ANGLE_DEG_180 - CIRCLE_ANGLE_DEG_90);
+    *out_send_deg = SEND_MAX_DEG + t * (0.0f - SEND_MAX_DEG);
+    return true;
+  }
+  if (circle_angle_deg <= (float)CIRCLE_ANGLE_DEG_270)
+  {
+    // 180 -> 270 : 0 -> -90
+    const float t = (circle_angle_deg - (float)CIRCLE_ANGLE_DEG_180) /
+                    (float)(CIRCLE_ANGLE_DEG_270 - CIRCLE_ANGLE_DEG_180);
+    *out_send_deg = 0.0f + t * SEND_MIN_DEG;
     return true;
   }
 
-  int apply(int idx, float raw_angle) {
-    if (!inited[idx]) {
-      filtered[idx] = raw_angle;
-      stable[idx] = clampi((int)(raw_angle + 0.5f), 0, 360);
-      inited[idx] = true;
-      pending_dir[idx] = 0;
-      pending_count[idx] = 0;
-      return stable[idx];
-    }
-
-    filtered[idx] += SERVO_FILTER_ALPHA * (raw_angle - filtered[idx]);
-    int candidate = clampi((int)(filtered[idx] + 0.5f), 0, 360);
-    int delta = candidate - stable[idx];
-    int abs_delta = abs(delta);
-    if (abs_delta <= SERVO_DEADZONE) {
-      pending_dir[idx] = 0;
-      pending_count[idx] = 0;
-      return stable[idx];
-    }
-
-    if (ENABLE_SERVO_JUMP_FILTER) {
-      // 大跳变需要连续多帧同向确认，抑制瞬时毛刺
-      if (abs_delta >= SERVO_JUMP_REJECT_THRESHOLD && !confirm_large_delta(idx, delta)) {
-        return stable[idx];
-      }
-      if (abs_delta < SERVO_JUMP_REJECT_THRESHOLD) {
-        pending_dir[idx] = 0;
-        pending_count[idx] = 0;
-      }
-    } else {
-      pending_dir[idx] = 0;
-      pending_count[idx] = 0;
-    }
-
-    if (delta > SERVO_MAX_STEP_PER_TICK) {
-      delta = SERVO_MAX_STEP_PER_TICK;
-    } else if (delta < -SERVO_MAX_STEP_PER_TICK) {
-      delta = -SERVO_MAX_STEP_PER_TICK;
-    }
-    stable[idx] = clampi(stable[idx] + delta, 0, 360);
-    return stable[idx];
-  }
-};
-
-static void build_servo_params(std::pair<int, int>* servo_params, ServoOutputFilter* filter) {
-  if (!servo_params || !filter) return;
-  for (int idx = 0; idx < SERVO_ID_COUNT; idx++) {
-    int out_angle = filter->apply(idx, readChannel(idx));
-    servo_params[idx] = {SERVO_ID_MIN + idx, out_angle};
-  }
+  // 270 -> 360 : -90 -> 0
+  const float t = (circle_angle_deg - (float)CIRCLE_ANGLE_DEG_270) /
+                  (float)(CIRCLE_ANGLE_DEG_360 - CIRCLE_ANGLE_DEG_270);
+  *out_send_deg = SEND_MIN_DEG + t * (0.0f - SEND_MIN_DEG);
+  return true;
 }
 
-static size_t collect_servo_deltas(const std::pair<int, int>* current_params,
-                                   const int* last_sent_angles,
-                                   const bool* last_sent_valid,
-                                   bool force_full_sync,
-                                   std::pair<int, int>* delta_params) {
-  if (!current_params || !last_sent_angles || !last_sent_valid || !delta_params) return 0;
-  size_t count = 0;
-  for (int idx = 0; idx < SERVO_ID_COUNT; idx++) {
-    int angle = current_params[idx].second;
-    int delta = abs(angle - last_sent_angles[idx]);
-    if (force_full_sync || !last_sent_valid[idx] || delta >= SERVO_SEND_MIN_DELTA) {
-      delta_params[count++] = current_params[idx];
-    }
+static bool copy_latest_i2c_frame(uint8_t *out_frame, size_t out_capacity, size_t *out_len)
+{
+  // 锁时间短：固定 48 字节 memcpy，避免阻塞采样任务或 I2C 发送任务太久。
+  if (!out_frame || out_capacity < BRIDGE_FRAME_SIZE || !out_len || !s_i2c_frame_mutex)
+    return false;
+  // 主机 read 的关键路径。若这里拿锁失败，本次事务就可能读到空数据。
+  // 由于发布路径只做 48 字节 memcpy，临界区极短，因此这里直接等待锁最稳妥。
+  if (xSemaphoreTake(s_i2c_frame_mutex, portMAX_DELAY) != pdTRUE)
+  {
+    return false;
   }
-  return count;
+  memcpy(out_frame, s_latest_i2c_frame, BRIDGE_FRAME_SIZE);
+  *out_len = s_latest_i2c_frame_len;
+  xSemaphoreGive(s_i2c_frame_mutex);
+  return (*out_len == BRIDGE_FRAME_SIZE);
 }
 
-static void update_last_sent_state(const std::pair<int, int>* sent_items,
-                                   size_t count,
-                                   int* last_sent_angles,
-                                   bool* last_sent_valid) {
-  if (!sent_items || !last_sent_angles || !last_sent_valid) return;
-  for (size_t i = 0; i < count; i++) {
-    int idx = sent_items[i].first - SERVO_ID_MIN;
-    if (idx < 0 || idx >= SERVO_ID_COUNT) continue;
-    last_sent_angles[idx] = sent_items[i].second;
-    last_sent_valid[idx] = true;
+static bool publish_latest_i2c_frame(const bridge_snapshot_t *snapshot)
+{
+  if (!snapshot || !s_i2c_frame_mutex)
+    return false;
+
+  uint8_t next_frame[BRIDGE_FRAME_SIZE] = {0};
+  size_t next_frame_len = 0;
+  const esp_err_t build_err =
+      bridge_build_frame(snapshot, next_frame, sizeof(next_frame), &next_frame_len);
+  if (build_err != ESP_OK || next_frame_len != BRIDGE_FRAME_SIZE)
+  {
+    ESP_LOGW(TAG,
+             "build frame failed: err=%s len=%u seq=%u",
+             esp_err_to_name(build_err),
+             (unsigned)next_frame_len,
+             (unsigned)snapshot->seq);
+    return false;
   }
+
+  if (xSemaphoreTake(s_i2c_frame_mutex, portMAX_DELAY) != pdTRUE)
+  {
+    return false;
+  }
+  memcpy(s_latest_i2c_frame, next_frame, BRIDGE_FRAME_SIZE);
+  s_latest_i2c_frame_len = next_frame_len;
+  xSemaphoreGive(s_i2c_frame_mutex);
+  return true;
 }
 
-static const char html_form[] =
-  "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>ESP32 配网</title></head>"
-  "<body><h2>请输入 WiFi 信息</h2>"
-  "<form action=\"/save\" method=\"POST\">"
-  "SSID: <input type=\"text\" name=\"ssid\"><br><br>"
-  "密码: <input type=\"password\" name=\"pass\"><br><br>"
-  "<input type=\"submit\" value=\"提交\">"
-  "</form></body></html>";
+static bool IRAM_ATTR on_i2c_slave_request(i2c_slave_dev_handle_t i2c_slave,
+                                           const i2c_slave_request_event_data_t *event_data,
+                                           void *user_ctx)
+{
+  (void)i2c_slave;
+  (void)event_data;
+  (void)user_ctx;
 
-static void safe_strcpy(char* dst, size_t dst_len, const char* src) {
-  if (!dst || dst_len == 0) return;
-  if (!src) {
-    dst[0] = '\0';
-    return;
+  BaseType_t task_woken = pdFALSE;
+  if (s_i2c_slave_tx_task_handle)
+  {
+    vTaskNotifyGiveFromISR(s_i2c_slave_tx_task_handle, &task_woken);
   }
-  size_t n = strlen(src);
-  if (n >= dst_len) n = dst_len - 1;
-  memcpy(dst, src, n);
-  dst[n] = '\0';
+  return (task_woken == pdTRUE);
 }
 
-static esp_err_t nvs_load_str(nvs_handle_t h, const char* key, char* out, size_t out_len, const char* def) {
-  size_t required = 0;
-  esp_err_t err = nvs_get_str(h, key, NULL, &required);
-  if (err == ESP_ERR_NVS_NOT_FOUND) {
-    safe_strcpy(out, out_len, def);
-    return ESP_OK;
-  }
-  if (err != ESP_OK) {
-    safe_strcpy(out, out_len, def);
+static esp_err_t init_i2c_slave()
+{
+  // 使用 ESP-IDF 6.1 的新版 slave driver：
+  // - 主机发起 read 时触发 on_request 回调
+  // - 回调只负责唤醒任务，不做重活
+  // - 真正的帧发送在任务上下文里调用 i2c_slave_write 完成
+  i2c_slave_config_t i2c_slave_config = {};
+  i2c_slave_config.i2c_port = I2C_SLAVE_PORT;
+  i2c_slave_config.sda_io_num = I2C_SLAVE_SDA_IO;
+  i2c_slave_config.scl_io_num = I2C_SLAVE_SCL_IO;
+  i2c_slave_config.clk_source = I2C_CLK_SRC_DEFAULT;
+  i2c_slave_config.send_buf_depth = I2C_SLAVE_SEND_BUF_DEPTH;
+  i2c_slave_config.receive_buf_depth = I2C_SLAVE_RECV_BUF_DEPTH;
+  i2c_slave_config.slave_addr = I2C_SLAVE_ADDR;
+  i2c_slave_config.addr_bit_len = I2C_ADDR_BIT_LEN_7;
+  i2c_slave_config.intr_priority = 0;
+  i2c_slave_config.flags.enable_internal_pullup = 1;
+
+  esp_err_t err = i2c_new_slave_device(&i2c_slave_config, &s_i2c_slave_handle);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "i2c_new_slave_device failed: %s", esp_err_to_name(err));
     return err;
   }
-  if (required == 0) {
-    safe_strcpy(out, out_len, def);
-    return ESP_OK;
-  }
-  if (required <= out_len) {
-    return nvs_get_str(h, key, out, &required);
-  }
-  char* tmp = (char*)malloc(required);
-  if (!tmp) {
-    safe_strcpy(out, out_len, def);
-    return ESP_ERR_NO_MEM;
-  }
-  err = nvs_get_str(h, key, tmp, &required);
-  if (err == ESP_OK) {
-    safe_strcpy(out, out_len, tmp);
-  } else {
-    safe_strcpy(out, out_len, def);
-  }
-  free(tmp);
-  return err;
-}
 
-static esp_err_t nvs_save_str(const char* key, const char* val) {
-  nvs_handle_t h;
-  esp_err_t err = nvs_open("wifi", NVS_READWRITE, &h);
-  if (err != ESP_OK) return err;
-  err = nvs_set_str(h, key, val ? val : "");
-  if (err == ESP_OK) {
-    err = nvs_commit(h);
-  }
-  nvs_close(h);
-  return err;
-}
-
-static void scan_networks() {
-  ESP_LOGI(TAG, "Scanning WiFi...");
-  wifi_scan_config_t scan_config = {};
-  scan_config.ssid = NULL;
-  scan_config.bssid = NULL;
-  scan_config.channel = 0;
-  scan_config.show_hidden = true;
-  scan_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-  scan_config.scan_time.active.min = 100;
-  scan_config.scan_time.active.max = 300;
-  esp_err_t err = esp_wifi_scan_start(&scan_config, true);
-  if (err != ESP_OK) {
-    ESP_LOGW(TAG, "WiFi scan failed: %s", esp_err_to_name(err));
-    return;
-  }
-  uint16_t ap_num = 0;
-  esp_wifi_scan_get_ap_num(&ap_num);
-  if (ap_num == 0) {
-    ESP_LOGI(TAG, "未找到网络");
-    return;
-  }
-  wifi_ap_record_t* ap_records = (wifi_ap_record_t*)calloc(ap_num, sizeof(wifi_ap_record_t));
-  if (!ap_records) {
-    return;
-  }
-  if (esp_wifi_scan_get_ap_records(&ap_num, ap_records) == ESP_OK) {
-    for (int i = 0; i < ap_num; ++i) {
-      ESP_LOGI(TAG, "%d: %s (%d)", i + 1, (char*)ap_records[i].ssid, ap_records[i].rssi);
-    }
-  }
-  free(ap_records);
-}
-
-static void restart_task(void* arg) {
-  vTaskDelay(pdMS_TO_TICKS(1500));
-  esp_restart();
-}
-
-static esp_err_t root_get_handler(httpd_req_t* req) {
-  httpd_resp_set_type(req, "text/html");
-  return httpd_resp_send(req, html_form, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t save_post_handler(httpd_req_t* req) {
-  int total_len = req->content_len;
-  if (total_len <= 0 || total_len > 512) {
-    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "参数错误");
-  }
-  char* buf = (char*)calloc(total_len + 1, 1);
-  if (!buf) {
-    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "内存不足");
-  }
-  int received = 0;
-  while (received < total_len) {
-    int ret = httpd_req_recv(req, buf + received, total_len - received);
-    if (ret <= 0) {
-      free(buf);
-      return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "读取失败");
-    }
-    received += ret;
+  i2c_slave_event_callbacks_t callbacks = {};
+  callbacks.on_request = on_i2c_slave_request;
+  err = i2c_slave_register_event_callbacks(s_i2c_slave_handle, &callbacks, nullptr);
+  if (err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "i2c_slave_register_event_callbacks failed: %s", esp_err_to_name(err));
+    return err;
   }
 
-  char ssid[33] = {0};
-  char pass[65] = {0};
-  if (httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid)) != ESP_OK ||
-      httpd_query_key_value(buf, "pass", pass, sizeof(pass)) != ESP_OK) {
-    free(buf);
-    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "参数错误");
-  }
-  free(buf);
-
-  nvs_save_str("ssid", ssid);
-  nvs_save_str("pass", pass);
-
-  httpd_resp_set_type(req, "text/plain");
-  httpd_resp_sendstr(req, "配置已保存，正在尝试连接...");
-  xTaskCreate(restart_task, "restart_task", 2048, NULL, 5, NULL);
+  ESP_LOGI(TAG,
+           "I2C slave ready: addr=0x%02X, SDA=%d, SCL=%d, frame_size=%u",
+           (unsigned)I2C_SLAVE_ADDR,
+           (int)I2C_SLAVE_SDA_IO,
+           (int)I2C_SLAVE_SCL_IO,
+           (unsigned)BRIDGE_FRAME_SIZE);
   return ESP_OK;
 }
 
-static httpd_handle_t start_http_server() {
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.server_port = 80;
+static void adc_capture_task(void *arg)
+{
+  (void)arg;
 
-  httpd_handle_t server = NULL;
-  if (httpd_start(&server, &config) != ESP_OK) {
-    return NULL;
-  }
+  // 周期采样任务：把“物理采样值(ADC原始码值)”转换为“可发送的角度快照”，并立即生成 I2C 帧缓存。
+  //
+  // 输出链路（每路）：
+  // adc_mux_sampler_read_raw_code(servo_index) -> adc_raw_code(0~4095)
+  //   -> normalize_adc_raw_code(servo_index, adc_raw_code) -> adc_normalized_code(0~4095)
+  //   -> wrap_adc_code(adc_normalized_code + ADC_PHASE_OFFSET_CODE[servo_index]) -> adc_phase_code(0~4095)
+  //   -> map_circle_angle_to_send_deg(adc_phase_code) -> send_angle_deg(-90~90)
+  //   -> send_deg_x10(int16) -> next_snapshot.send_deg_x10[servo_index]
+  //   -> bridge_build_frame(next_snapshot) -> s_latest_i2c_frame
+  //
+  // 设计点：
+  // - 直接读取 ADC 原始码值，避免“角度 -> 码值 -> 角度”的来回转换与舍入误差
+  // - 读数失败/异常时，保持上一帧有效输出，避免主机侧控制量突然跳变
+  uint16_t sample_seq = 0;
+  bridge_snapshot_t next_snapshot = {};
+  uint32_t last_debug_log_time_ms = 0;
 
-  httpd_uri_t root = {
-    .uri = "/",
-    .method = HTTP_GET,
-    .handler = root_get_handler,
-    .user_ctx = NULL
-  };
-  httpd_register_uri_handler(server, &root);
+  adc_mux_sampler_read_opts_t read_opts = adc_mux_sampler_default_read_opts();
+  read_opts.sample_count = ADC_MUX_SAMPLER_DEFAULT_SAMPLE_COUNT;
+  read_opts.trim_extremes = true;
 
-  httpd_uri_t save = {
-    .uri = "/save",
-    .method = HTTP_POST,
-    .handler = save_post_handler,
-    .user_ctx = NULL
-  };
-  httpd_register_uri_handler(server, &save);
+  int adc_raw_code_cache[SERVO_COUNT] = {0};
+  int adc_normalized_code_cache[SERVO_COUNT] = {0};
+  int adc_phase_code_cache[SERVO_COUNT] = {0};
+  int adc_read_err_cache[SERVO_COUNT] = {0}; // ESP_OK=0，其他为错误码
+  int16_t last_send_deg_x10[SERVO_COUNT] = {0};
 
-  return server;
-}
+  while (true)
+  {
+    next_snapshot.seq = ++sample_seq;
+    // esp_timer_get_time() 单位是 us，这里转成 ms 方便与日志/主机侧对齐。
+    next_snapshot.uptime_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
-static void start_ap_mode() {
-  ESP_LOGW(TAG, "WiFi 连接失败，进入AP模式");
-  ESP_LOGW(TAG, "保留当前NVS中的WiFi配置，不自动清空凭据");
+    for (size_t servo_index = 0; servo_index < SERVO_COUNT; servo_index++)
+    {
+      // servo_index 是 0~16，对应 servo_id = SERVO_ID_MIN + servo_index。
+      // 采样函数会切换 MUX 地址线，因此该循环内不要做并发/阻塞操作，保持节拍稳定。
+      int adc_raw_code = 0;
+      const esp_err_t read_err = adc_mux_sampler_read_raw_code(
+          &s_adc_sampler, (uint8_t)servo_index, &read_opts, &adc_raw_code);
+      adc_read_err_cache[servo_index] = (int)read_err;
 
-  if (!s_ap_netif_created) {
-    esp_netif_create_default_wifi_ap();
-    s_ap_netif_created = true;
-  }
+      if (read_err != ESP_OK)
+      {
+        // 读数失败：本次不更新该通道输出，直接保持上一有效值。
+        next_snapshot.send_deg_x10[servo_index] = last_send_deg_x10[servo_index];
+        continue;
+      }
 
-  wifi_config_t wifi_config = {};
-  safe_strcpy((char*)wifi_config.ap.ssid, sizeof(wifi_config.ap.ssid), "ESP_32_AP");
-  safe_strcpy((char*)wifi_config.ap.password, sizeof(wifi_config.ap.password), "00000000");
-  wifi_config.ap.ssid_len = strlen((char*)wifi_config.ap.ssid);
-  wifi_config.ap.channel = 1;
-  wifi_config.ap.max_connection = 4;
-  wifi_config.ap.authmode = WIFI_AUTH_WPA_WPA2_PSK;
-  if (strlen((char*)wifi_config.ap.password) == 0) {
-    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
-  }
+      adc_raw_code_cache[servo_index] = adc_raw_code;
+      const int adc_normalized_code = normalize_adc_raw_code(servo_index, adc_raw_code);
+      const int adc_phase_code =
+          wrap_adc_code(adc_normalized_code + ADC_PHASE_OFFSET_CODE[servo_index]);
+      adc_normalized_code_cache[servo_index] = adc_normalized_code;
+      adc_phase_code_cache[servo_index] = adc_phase_code;
 
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-  ESP_ERROR_CHECK(esp_wifi_start());
+      float send_angle_deg = 0.0f;
+      if (!map_circle_angle_to_send_deg(adc_phase_code, &send_angle_deg))
+      {
+        next_snapshot.send_deg_x10[servo_index] = last_send_deg_x10[servo_index];
+        continue;
+      }
 
-  s_httpd = start_http_server();
-  if (s_httpd) {
-    ESP_LOGI(TAG, "AP 配网页面已启动");
-  }
-}
-
-static const char* wifi_disconnect_reason_to_str(uint8_t reason) {
-  switch (reason) {
-    case WIFI_REASON_NO_AP_FOUND: return "NO_AP_FOUND";
-    case WIFI_REASON_AUTH_FAIL: return "AUTH_FAIL";
-    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: return "4WAY_HANDSHAKE_TIMEOUT";
-    case WIFI_REASON_HANDSHAKE_TIMEOUT: return "HANDSHAKE_TIMEOUT";
-    case WIFI_REASON_BEACON_TIMEOUT: return "BEACON_TIMEOUT";
-    case WIFI_REASON_ASSOC_FAIL: return "ASSOC_FAIL";
-    case WIFI_REASON_CONNECTION_FAIL: return "CONNECTION_FAIL";
-    case WIFI_REASON_ROAMING: return "ROAMING";
-    default: return "UNKNOWN";
-  }
-}
-
-static bool is_auth_failure_reason(uint8_t reason) {
-  switch (reason) {
-    case WIFI_REASON_AUTH_FAIL:
-    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
-    case WIFI_REASON_HANDSHAKE_TIMEOUT:
-      return true;
-    default:
-      return false;
-  }
-}
-
-static bool is_no_ap_reason(uint8_t reason) {
-  return reason == WIFI_REASON_NO_AP_FOUND;
-}
-
-static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
-  if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*)event_data;
-    uint8_t reason = event ? event->reason : 0xFF;
-    bool auth_fail = is_auth_failure_reason(reason);
-    bool no_ap = is_no_ap_reason(reason);
-
-    s_retry_num++;
-    s_retry_auth_fail = auth_fail ? (s_retry_auth_fail + 1) : 0;
-    s_retry_no_ap = no_ap ? (s_retry_no_ap + 1) : 0;
-
-    ESP_LOGW(TAG,
-             "WiFi断开: reason=%u(%s), total_retry=%d, auth_retry=%d, no_ap_retry=%d",
-             reason,
-             wifi_disconnect_reason_to_str(reason),
-             s_retry_num,
-             s_retry_auth_fail,
-             s_retry_no_ap);
-
-    if (s_retry_num >= WIFI_MAX_RETRY_TOTAL ||
-        s_retry_auth_fail >= WIFI_MAX_RETRY_AUTH_FAIL ||
-        s_retry_no_ap >= WIFI_MAX_RETRY_NO_AP) {
-      ESP_LOGE(TAG, "WiFi重连达到上限，设置失败位并进入AP配网模式");
-      xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-      return;
+      // 量化到 0.1 度（int16），并夹到 [-900,900]，避免异常值把帧结构搞乱。
+      const int send_deg_x10_i32 = (int)roundf(send_angle_deg * 10.0f);
+      const int16_t send_deg_x10 = (int16_t)clamp_int(send_deg_x10_i32, -900, 900);
+      last_send_deg_x10[servo_index] = send_deg_x10;
+      next_snapshot.send_deg_x10[servo_index] = send_deg_x10;
     }
 
-    esp_err_t err = esp_wifi_connect();
-    if (err != ESP_OK) {
-      ESP_LOGW(TAG, "esp_wifi_connect失败: %s", esp_err_to_name(err));
-    }
-  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-    ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
-    ESP_LOGI(TAG, "WiFi 连接成功, IP: " IPSTR, IP2STR(&event->ip_info.ip));
-    s_retry_num = 0;
-    s_retry_auth_fail = 0;
-    s_retry_no_ap = 0;
-    xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
-    xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-  } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
-    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    ESP_LOGW(TAG, "IP丢失，等待重新获取");
-  }
-}
+    // 采样任务直接发布“最新整帧”，这样 I2C 任务只负责发送，不再现场构帧。
+    (void)publish_latest_i2c_frame(&next_snapshot);
 
-static void wifi_init_sta(const char* ssid, const char* pass) {
-  s_wifi_event_group = xEventGroupCreate();
-  ESP_ERROR_CHECK(esp_netif_init());
-  ESP_ERROR_CHECK(esp_event_loop_create_default());
-  esp_netif_create_default_wifi_sta();
+    if (next_snapshot.uptime_ms - last_debug_log_time_ms >= ADC_DEBUG_LOG_INTERVAL_MS)
+    {
+      last_debug_log_time_ms = next_snapshot.uptime_ms;
 
-  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+      // 定期输出关键通道的“链路中间态”，用于排查：
+      // - ADC 读数是否成功（E(xxx)）
+      // - 原始 ADC 是否正常波动（adc_raw_code）
+      // - 归一化参数是否正确（adc_normalized_code）
+      // - 相位偏移是否生效（adc_phase_code）
+      // - 最终发送角度是否符合预期（send_angle_deg）
+      char log_line[256] = {0};
+      int written =
+          snprintf(log_line, sizeof(log_line), "MAP seq=%u ", (unsigned)next_snapshot.seq);
+      size_t used_len = (written > 0) ? (size_t)written : 0U;
 
-  ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-  ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
-  ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, &wifi_event_handler, NULL));
+      for (size_t debug_index = 0; debug_index < DEBUG_SERVO_ID_COUNT; debug_index++)
+      {
+        const uint8_t servo_id = DEBUG_SERVO_IDS[debug_index];
+        const int servo_index = (int)servo_id - (int)SERVO_ID_MIN;
+        if (servo_index < 0 || servo_index >= (int)SERVO_COUNT)
+          continue;
 
-  wifi_config_t wifi_config = {};
-  safe_strcpy((char*)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), ssid);
-  safe_strcpy((char*)wifi_config.sta.password, sizeof(wifi_config.sta.password), pass);
-  wifi_config.sta.pmf_cfg.capable = true;
-  wifi_config.sta.pmf_cfg.required = false;
-  wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
-  wifi_config.sta.failure_retry_cnt = 10;
+        const int read_err = adc_read_err_cache[servo_index];
+        const int adc_raw_code = adc_raw_code_cache[servo_index];
+        const int adc_normalized_code = adc_normalized_code_cache[servo_index];
+        const int adc_phase_code = adc_phase_code_cache[servo_index];
+        const float send_angle_deg = next_snapshot.send_deg_x10[servo_index] / 10.0f;
 
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-  ESP_ERROR_CHECK(esp_wifi_start());
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE)); // 关闭省电，降低链路抖动断连概率
-
-  scan_networks();
-  ESP_LOGI(TAG, "正在连接 WiFi (%s)...", ssid);
-  esp_wifi_connect();
-
-  EventBits_t bits = xEventGroupWaitBits(
-      s_wifi_event_group,
-      WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-      pdFALSE,
-      pdFALSE,
-      pdMS_TO_TICKS(WIFI_CONNECT_WAIT_MS));
-
-  if (bits & WIFI_CONNECTED_BIT) {
-    ESP_LOGI(TAG, "WiFi 已连接");
-  } else {
-    ESP_LOGW(TAG, "WiFi 连接失败");
-    start_ap_mode();
-  }
-}
-
-static void handle_servo_control(cJSON* obj) {
-  if (!cJSON_IsObject(obj)) return;
-  cJSON* c = cJSON_GetObjectItemCaseSensitive(obj, "c");
-  cJSON* p = cJSON_GetObjectItemCaseSensitive(obj, "p");
-  if (cJSON_IsNumber(c) && cJSON_IsNumber(p)) {
-    int channel = c->valueint;
-    int pulse = p->valueint;
-    if (pulse < 0) pulse = 0;
-    if (pulse > 4095) pulse = 4095;
-    ESP_LOGI(TAG, "设置通道 %d 脉宽 %d", channel, pulse);
-  }
-}
-
-static void try_pick_target_id_from_list(cJSON* arr) {
-  if (!cJSON_IsArray(arr)) return;
-
-  cJSON* item = NULL;
-  if (has_preferred_target_name()) {
-    // 1) 配置了偏好目标名时，先尝试按名称精确匹配
-    cJSON_ArrayForEach(item, arr) {
-      cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
-      cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
-      const char* name_str = cJSON_IsString(name) ? name->valuestring : "";
-      const char* id_str = cJSON_IsString(id) ? id->valuestring : "";
-      if (!id_str || !*id_str) continue;
-      if (ws_self_id[0] != '\0' && strcmp(id_str, ws_self_id) == 0) continue;
-      if (strcmp(name_str, PREFERRED_TARGET_NAME) == 0) {
-        if (strcmp(ws_target_id, id_str) != 0) {
-          safe_strcpy(ws_target_id, sizeof(ws_target_id), id_str);
-          ESP_LOGI(TAG, "按偏好名绑定目标 %s, id=%s", PREFERRED_TARGET_NAME, ws_target_id);
+        if (read_err != ESP_OK)
+        {
+          written = snprintf(log_line + used_len,
+                             (used_len < sizeof(log_line)) ? (sizeof(log_line) - used_len) : 0,
+                             "%u:E(%d) ",
+                             (unsigned)servo_id,
+                             read_err);
         }
-        return;
-      }
-    }
-  }
-
-  // 2) 自动绑定首个非本机在线设备（不限制名称）
-  const char* fallback_name = NULL;
-  const char* fallback_id = NULL;
-  cJSON_ArrayForEach(item, arr) {
-    cJSON* name = cJSON_GetObjectItemCaseSensitive(item, "name");
-    cJSON* id = cJSON_GetObjectItemCaseSensitive(item, "id");
-    const char* name_str = cJSON_IsString(name) ? name->valuestring : "";
-    const char* id_str = cJSON_IsString(id) ? id->valuestring : "";
-    if (!id_str || !*id_str) continue;
-    if (ws_self_id[0] != '\0' && strcmp(id_str, ws_self_id) == 0) continue;
-    if (ws_self_id[0] == '\0' && strcmp(name_str, g_board_name) == 0) continue;
-
-    fallback_name = name_str;
-    fallback_id = id_str;
-    break;
-  }
-
-  if (fallback_id && *fallback_id) {
-    if (strcmp(ws_target_id, fallback_id) != 0) {
-      safe_strcpy(ws_target_id, sizeof(ws_target_id), fallback_id);
-      if (has_preferred_target_name()) {
-        ESP_LOGW(TAG, "未找到偏好目标名 %s，回退绑定 %s, id=%s",
-                 PREFERRED_TARGET_NAME,
-                 fallback_name ? fallback_name : "",
-                 ws_target_id);
-      } else {
-        ESP_LOGI(TAG, "自动绑定目标 %s, id=%s", fallback_name ? fallback_name : "", ws_target_id);
-      }
-    }
-    return;
-  }
-
-  if (has_preferred_target_name()) {
-    ESP_LOGW(TAG, "在线列表里没有可绑定目标(偏好名=%s, 本机名=%s)", PREFERRED_TARGET_NAME, g_board_name);
-  } else {
-    ESP_LOGW(TAG, "在线列表里没有可绑定目标(本机名=%s)", g_board_name);
-  }
-}
-
-static void handle_message(const char* message) {
-  cJSON* doc = cJSON_Parse(message);
-  if (!doc) {
-    ESP_LOGW(TAG, "JSON解析错误");
-    return;
-  }
-  cJSON* type = cJSON_GetObjectItemCaseSensitive(doc, "type");
-  if (!cJSON_IsString(type) || !type->valuestring) {
-    cJSON_Delete(doc);
-    return;
-  }
-
-  const char* type_str = type->valuestring;
-  if (strcmp(type_str, "heartbeat") == 0) {
-    _ws_send("{\"type\":\"heartbeat\"}");
-    cJSON_Delete(doc);
-    return;
-  }
-
-  if (strcmp(type_str, "connected") == 0 || strcmp(type_str, "presence") == 0) {
-    if (strcmp(type_str, "connected") == 0) {
-      cJSON* clientId = cJSON_GetObjectItemCaseSensitive(doc, "clientId");
-      const char* self_id = cJSON_IsString(clientId) ? clientId->valuestring : "";
-      if (self_id && *self_id && strcmp(ws_self_id, self_id) != 0) {
-        safe_strcpy(ws_self_id, sizeof(ws_self_id), self_id);
-        ESP_LOGI(TAG, "记录本机clientId=%s", ws_self_id);
-      }
-    }
-
-    cJSON* onlineClients = cJSON_GetObjectItemCaseSensitive(doc, "onlineClients");
-    cJSON* onlineUsers = cJSON_GetObjectItemCaseSensitive(doc, "onlineUsers");
-    if (onlineClients) try_pick_target_id_from_list(onlineClients);
-    if (onlineUsers) try_pick_target_id_from_list(onlineUsers);
-
-    if (strcmp(type_str, "connected") == 0) {
-      g_send_as_servo_control = true;
-      ESP_LOGI(TAG, "已切换：开始发送 type=servo_control");
-    }
-    cJSON_Delete(doc);
-    return;
-  }
-
-  if (strcmp(type_str, "broadcast") == 0) {
-    cJSON* content = cJSON_GetObjectItemCaseSensitive(doc, "content");
-    const char* content_str = cJSON_IsString(content) ? content->valuestring : "";
-    ESP_LOGI(TAG, "收到广播: %s", content_str);
-    cJSON_Delete(doc);
-    return;
-  }
-
-  if (strcmp(type_str, "private") == 0) {
-    cJSON* fromName = cJSON_GetObjectItemCaseSensitive(doc, "fromName");
-    cJSON* content = cJSON_GetObjectItemCaseSensitive(doc, "content");
-    const char* from_str = cJSON_IsString(fromName) ? fromName->valuestring : "";
-    const char* content_str = cJSON_IsString(content) ? content->valuestring : "";
-    ESP_LOGI(TAG, "收到私聊 - 来自 %s: %s", from_str, content_str);
-
-    cJSON* arr = cJSON_Parse(content_str);
-    if (arr && cJSON_IsArray(arr)) {
-      cJSON* item = NULL;
-      cJSON_ArrayForEach(item, arr) {
-        handle_servo_control(item);
-      }
-    }
-    if (arr) cJSON_Delete(arr);
-    cJSON_Delete(doc);
-    return;
-  }
-
-  if (strcmp(type_str, "servo_control") == 0) {
-    cJSON* content = cJSON_GetObjectItemCaseSensitive(doc, "content");
-    const char* content_str = cJSON_IsString(content) ? content->valuestring : "";
-    cJSON* arr = cJSON_Parse(content_str);
-    if (arr && cJSON_IsArray(arr)) {
-      cJSON* item = NULL;
-      cJSON_ArrayForEach(item, arr) {
-        handle_servo_control(item);
-      }
-    }
-    if (arr) cJSON_Delete(arr);
-    cJSON_Delete(doc);
-    return;
-  }
-
-  ESP_LOGI(TAG, "未知消息类型");
-  cJSON_Delete(doc);
-}
-
-static void websocket_event_handler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data) {
-  esp_websocket_event_data_t* data = (esp_websocket_event_data_t*)event_data;
-  switch (event_id) {
-    case WEBSOCKET_EVENT_CONNECTED: {
-      ESP_LOGI(TAG, "WebSocket 连接成功");
-      cJSON* reg = cJSON_CreateObject();
-      if (reg) {
-        cJSON_AddStringToObject(reg, "type", "register");
-        cJSON_AddStringToObject(reg, "name", g_board_name);
-        char* json = cJSON_PrintUnformatted(reg);
-        if (json) {
-          _ws_send(json);
-          free(json);
+        else
+        {
+          written = snprintf(log_line + used_len,
+                             (used_len < sizeof(log_line)) ? (sizeof(log_line) - used_len) : 0,
+                             "%u:%d/%d/%d->%.1f ",
+                             (unsigned)servo_id,
+                             adc_raw_code,
+                             adc_normalized_code,
+                             adc_phase_code,
+                             send_angle_deg);
         }
-        cJSON_Delete(reg);
-      }
-      break;
-    }
-    case WEBSOCKET_EVENT_DISCONNECTED:
-      ESP_LOGW(TAG, "WebSocket 断开连接");
-      g_send_as_servo_control = false;
-      break;
-    case WEBSOCKET_EVENT_DATA:
-      if (data && data->data_ptr && data->data_len > 0) {
-        char* msg = (char*)calloc(data->data_len + 1, 1);
-        if (msg) {
-          memcpy(msg, data->data_ptr, data->data_len);
-          msg[data->data_len] = '\0';
-          ESP_LOGI(TAG, "收到消息: %s", msg);
-          handle_message(msg);
-          free(msg);
-        }
-      }
-      break;
-    default:
-      break;
-  }
-}
 
-static void start_websocket() {
-  esp_websocket_client_config_t ws_cfg = {};
-  ws_cfg.uri = "ws://192.168.0.100:9102/";
-  ws_cfg.buffer_size = 2048;
-  ws_cfg.disable_auto_reconnect = false;
-  ws_cfg.reconnect_timeout_ms = WS_RECONNECT_TIMEOUT_MS;
-  ws_cfg.network_timeout_ms = WS_NETWORK_TIMEOUT_MS;
-  ws_cfg.pingpong_timeout_sec = WS_PINGPONG_TIMEOUT_SEC;
-  ws_cfg.disable_pingpong_discon = WS_DISABLE_PINGPONG_DISCON;
-  ws_cfg.keep_alive_enable = WS_TCP_KEEPALIVE_ENABLE;
-  ws_cfg.keep_alive_idle = WS_TCP_KEEPALIVE_IDLE_SEC;
-  ws_cfg.keep_alive_interval = WS_TCP_KEEPALIVE_INTERVAL_SEC;
-  ws_cfg.keep_alive_count = WS_TCP_KEEPALIVE_COUNT;
-  ws_client = esp_websocket_client_init(&ws_cfg);
-  esp_websocket_register_events(ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
-  esp_websocket_client_start(ws_client);
-}
-
-static void app_task(void* arg) {
-  uint32_t last_send_ms = 0;
-  uint32_t last_heartbeat_ms = 0;
-  uint32_t last_wait_bind_log_ms = 0;
-  uint32_t last_wait_ws_log_ms = 0;
-  uint32_t last_no_change_log_ms = 0;
-  uint32_t last_send_throttle_log_ms = 0;
-  bool prev_ws_connected = false;
-  bool need_full_sync = true;
-
-  ServoOutputFilter servo_filter;
-  int last_sent_angles[SERVO_ID_COUNT] = {0};
-  bool last_sent_valid[SERVO_ID_COUNT] = {false};
-
-  while (true) {
-    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
-    if (bits & WIFI_CONNECTED_BIT) {
-      uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
-      bool ws_connected = is_ws_connected();
-
-      if (ws_connected && !prev_ws_connected) {
-        need_full_sync = true;
-        ESP_LOGI(TAG, "WebSocket恢复连接, 下次发送全量同步");
-      }
-      prev_ws_connected = ws_connected;
-
-      if (now_ms - last_send_ms >= SEND_INTERVAL_MS) {
-        last_send_ms = now_ms;
-
-        if (ws_target_id[0] != '\0') {
-          if (ws_connected) {
-            std::pair<int, int> currentParams[SERVO_ID_COUNT];
-            std::pair<int, int> deltaParams[SERVO_ID_COUNT];
-            build_servo_params(currentParams, &servo_filter);
-
-            size_t delta_count = collect_servo_deltas(currentParams, last_sent_angles, last_sent_valid, need_full_sync, deltaParams);
-            if (delta_count == 0) {
-              if (now_ms - last_no_change_log_ms >= NO_CHANGE_LOG_INTERVAL_MS) {
-                last_no_change_log_ms = now_ms;
-                ESP_LOGI(TAG, "舵机无变化, 本周期不发送");
-              }
-            } else {
-              size_t sent_total = 0;
-              size_t offset = 0;
-              size_t sent_batches = 0;
-              while (offset < delta_count && sent_batches < (size_t)SERVO_MAX_BATCH_PER_TICK) {
-                size_t remain = delta_count - offset;
-                size_t batch_count = remain > (size_t)SERVO_SEND_BATCH_MAX ? (size_t)SERVO_SEND_BATCH_MAX : remain;
-                bool ok = sendServoControl(deltaParams + offset, batch_count);
-                if (!ok) {
-                  ESP_LOGW(TAG, "增量发送失败, 已发送=%u, 总计=%u", (unsigned)sent_total, (unsigned)delta_count);
-                  break;
-                }
-
-                update_last_sent_state(deltaParams + offset, batch_count, last_sent_angles, last_sent_valid);
-                if (ENABLE_SERVER_CONTROL_MIRROR && g_send_as_servo_control) {
-                  sendServoControlAsServerControl(deltaParams + offset, batch_count);
-                }
-                sent_total += batch_count;
-                offset += batch_count;
-                sent_batches++;
-              }
-
-              if (offset < delta_count && now_ms - last_send_throttle_log_ms >= SEND_THROTTLE_LOG_INTERVAL_MS) {
-                last_send_throttle_log_ms = now_ms;
-                ESP_LOGW(TAG, "发送限流生效, 本周期发送=%u, 待发送=%u", (unsigned)sent_total, (unsigned)(delta_count - sent_total));
-              }
-
-              if (need_full_sync && sent_total == delta_count) {
-                need_full_sync = false;
-                ESP_LOGI(TAG, "全量同步完成, 切换为增量发送");
-              }
-            }
-          } else if (now_ms - last_wait_ws_log_ms >= WAIT_WS_LOG_INTERVAL_MS) {
-            last_wait_ws_log_ms = now_ms;
-            ESP_LOGW(TAG, "WebSocket未连接, 暂停发送(目标ID=%s)", ws_target_id);
+        if (written > 0)
+        {
+          const size_t inc = (size_t)written;
+          if (used_len + inc < sizeof(log_line))
+          {
+            used_len += inc;
           }
-        } else if (now_ms - last_wait_bind_log_ms >= WAIT_BIND_LOG_INTERVAL_MS) {
-          last_wait_bind_log_ms = now_ms;
-          ESP_LOGI(TAG, "等待绑定: 尚未获取目标ID, 跳过发送");
+          else
+          {
+            used_len = sizeof(log_line) - 1;
+          }
+        }
+
+        if (debug_index == 4)
+        {
+          // 分两行打印，避免单行太长导致日志截断（也便于肉眼对齐观察）。
+          ESP_LOGI(TAG, "%s", log_line);
+          log_line[0] = '\0';
+          used_len = 0;
         }
       }
 
-      if (ws_connected && now_ms - last_heartbeat_ms > 15000) {
-        if (_ws_send("{\"type\":\"heartbeat\"}")) {
-          last_heartbeat_ms = now_ms;
-          ESP_LOGI(TAG, "已发送WebSocket心跳包");
-        }
+      if (used_len > 0)
+      {
+        ESP_LOGI(TAG, "%s", log_line);
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(10));
+
+    // 固定延时。注意：FreeRTOS 的延时精度受 tick 影响；若你对频率很敏感，可改用 vTaskDelayUntil。
+    vTaskDelay(pdMS_TO_TICKS(ADC_CAPTURE_INTERVAL_MS));
   }
 }
 
-extern "C" void app_main(void) {
-  esp_err_t ret = nvs_flash_init();
-  if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+static void i2c_slave_tx_task(void *arg)
+{
+  (void)arg;
+
+  // I2C 从机发送任务：
+  // - on_request 回调只负责用 task notification 唤醒本任务
+  // - 本任务在正常任务上下文里复制“最新一整帧”并调用 i2c_slave_write
+  //
+  // 这样做的目的：
+  // - ISR 内不做 mutex / 构帧 / 日志等重操作
+  // - 每次主机 read 都只推送一帧，避免旧方案的 ring buffer 连续字节流错位
+  uint8_t tx_frame[BRIDGE_FRAME_SIZE] = {0};
+
+  while (true)
+  {
+    const uint32_t pending_request_count = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    if (pending_request_count == 0)
+    {
+      continue;
+    }
+
+    size_t tx_frame_len = 0;
+    if (!copy_latest_i2c_frame(tx_frame, sizeof(tx_frame), &tx_frame_len))
+    {
+      ESP_LOGW(TAG, "latest i2c frame not ready");
+      continue;
+    }
+
+    uint32_t written_len = 0;
+    const esp_err_t write_err =
+        i2c_slave_write(s_i2c_slave_handle,
+                        tx_frame,
+                        (uint32_t)tx_frame_len,
+                        &written_len,
+                        I2C_SLAVE_WRITE_TIMEOUT_MS);
+    if (write_err != ESP_OK)
+    {
+      ESP_LOGW(TAG,
+               "i2c_slave_write failed: err=%s len=%u req=%u",
+               esp_err_to_name(write_err),
+               (unsigned)tx_frame_len,
+               (unsigned)pending_request_count);
+      continue;
+    }
+
+    if (written_len != tx_frame_len)
+    {
+      ESP_LOGW(TAG,
+               "i2c slave short write: tx=%u expect=%u req=%u",
+               (unsigned)written_len,
+               (unsigned)tx_frame_len,
+               (unsigned)pending_request_count);
+    }
+  }
+}
+
+extern "C" void app_main(void)
+{
+  // ESP-IDF 入口。此处主要做资源初始化与任务启动。
+  esp_err_t nvs_err = nvs_flash_init();
+  if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+  {
     ESP_ERROR_CHECK(nvs_flash_erase());
     ESP_ERROR_CHECK(nvs_flash_init());
   }
 
-  nvs_handle_t h;
-  if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) {
-    nvs_load_str(h, "ssid", g_ssid, sizeof(g_ssid), DEFAULT_SSID);
-    nvs_load_str(h, "pass", g_pass, sizeof(g_pass), DEFAULT_PASS);
-    nvs_load_str(h, "name", g_board_name, sizeof(g_board_name), DEFAULT_NAME);
-    nvs_close(h);
+  s_i2c_frame_mutex = xSemaphoreCreateMutex();
+  if (!s_i2c_frame_mutex)
+  {
+    ESP_LOGE(TAG, "create i2c frame mutex failed");
+    return;
   }
 
-  ESP_LOGI(TAG, "读取到的设备名: %s", g_board_name);
-
-  ensureMuxADC();
-
-  wifi_init_sta(g_ssid, g_pass);
-
-  if (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) {
-    start_websocket();
+  // 先发布一帧全 0 快照，确保主机在采样任务启动前发起 read 时，也能拿到合法帧头和 CRC。
+  bridge_snapshot_t initial_snapshot = {};
+  if (!publish_latest_i2c_frame(&initial_snapshot))
+  {
+    ESP_LOGE(TAG, "publish initial i2c frame failed");
+    return;
   }
 
-  xTaskCreate(app_task, "app_task", 4096, NULL, 5, NULL);
+  // 初始化采样硬件（GPIO + ADC oneshot）。
+  // 若初始化失败，采样任务会一直读不到数据，直接在这里 fail-fast 更容易定位问题。
+  adc_mux_sampler_config_t sampler_cfg = adc_mux_sampler_default_config();
+  const esp_err_t sampler_err = adc_mux_sampler_init(&s_adc_sampler, &sampler_cfg);
+  if (sampler_err != ESP_OK)
+  {
+    ESP_LOGE(TAG, "adc sampler init failed: %s", esp_err_to_name(sampler_err));
+    return;
+  }
+
+  if (init_i2c_slave() != ESP_OK)
+  {
+    return;
+  }
+
+  xTaskCreate(adc_capture_task, "adc_capture", 4096, nullptr, 5, nullptr);
+  xTaskCreate(i2c_slave_tx_task, "i2c_slave_tx", 4096, nullptr, 6, &s_i2c_slave_tx_task_handle);
+
+  ESP_LOGI(TAG,
+           "ESP32 bridge started: adc_channels=%u, servo_id_range=%u-%u",
+           (unsigned)SERVO_COUNT,
+           (unsigned)SERVO_ID_MIN,
+           (unsigned)SERVO_ID_MAX);
 }

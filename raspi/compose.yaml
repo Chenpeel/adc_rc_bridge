@@ -1,0 +1,22 @@
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raspi-bridge
+    init: true
+    network_mode: host
+    restart: unless-stopped
+    devices:
+      - /dev/i2c-1:/dev/i2c-1
+    volumes:
+      # 当前 docker compose 版本在“文件级 bind mount”场景下会触发 rbind(MS_REC)，
+      # 导致把单文件挂载到 /app/config.json 失败。这里改为挂载整个目录，再从目录内读取 config.json。
+      - ./:/config:ro
+    command:
+      - uv
+      - run
+      - python
+      - /app/bridge.py
+      - --config
+      - /config/config.json
