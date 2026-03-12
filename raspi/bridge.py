@@ -169,7 +169,9 @@ class RaspiWsBridge:
 
         self.latest_seq = 0
         self.latest_uptime_ms = 0
-        self.latest_angles: Optional[list[int]] = None
+        self.latest_frame_angles_deg: Optional[list[float]] = None
+        self.latest_reversed_angles_deg: Optional[list[float]] = None
+        self.latest_filtered_angles_deg: Optional[list[int]] = None
 
         self.ws_self_id = ""
         self.ws_target_id = ""
@@ -207,14 +209,21 @@ class RaspiWsBridge:
                 seq, uptime_ms, send_angles = parsed_frame
 
                 # 方向修正应尽早应用，保证后续滤波、死区、增量判断在同一坐标系下工作。
+                frame_angles_deg = send_angles
                 if self.any_servo_reversed:
-                    send_angles = apply_servo_reverse_mask(send_angles, self.servo_reverse_mask)
-                filtered = [self.servo_filter.apply(i, send_angles[i]) for i in range(SERVO_COUNT)]
+                    reversed_angles_deg = apply_servo_reverse_mask(send_angles, self.servo_reverse_mask)
+                else:
+                    reversed_angles_deg = send_angles[:]
+                filtered_angles_deg = [
+                    self.servo_filter.apply(i, reversed_angles_deg[i]) for i in range(SERVO_COUNT)
+                ]
 
                 async with self.state_lock:
                     self.latest_seq = seq
                     self.latest_uptime_ms = uptime_ms
-                    self.latest_angles = filtered
+                    self.latest_frame_angles_deg = frame_angles_deg[:]
+                    self.latest_reversed_angles_deg = reversed_angles_deg[:]
+                    self.latest_filtered_angles_deg = filtered_angles_deg
             except OSError as exc:
                 if exc.errno == errno.EREMOTEIO:
                     logging.warning(
@@ -375,7 +384,13 @@ class RaspiWsBridge:
     async def try_send_servo_delta(self, ws: websockets.WebSocketClientProtocol, now: float) -> None:
         async with self.state_lock:
             target_id = self.ws_target_id
-            angles = self.latest_angles[:] if self.latest_angles else None
+            filtered_angles_deg = (
+                self.latest_filtered_angles_deg[:] if self.latest_filtered_angles_deg else None
+            )
+            frame_angles_deg = self.latest_frame_angles_deg[:] if self.latest_frame_angles_deg else None
+            reversed_angles_deg = (
+                self.latest_reversed_angles_deg[:] if self.latest_reversed_angles_deg else None
+            )
             need_full_sync = self.need_full_sync
             latest_seq = self.latest_seq
             latest_uptime_ms = self.latest_uptime_ms
@@ -386,13 +401,13 @@ class RaspiWsBridge:
                 logging.info("等待绑定: 尚未获取目标ID，跳过发送")
             return
 
-        if not angles:
+        if not filtered_angles_deg or not frame_angles_deg or not reversed_angles_deg:
             return
 
         # 先收集“未同步成功”的通道，避免被前几个频繁变化通道长期挤占带宽
         unsynced_items: list[tuple[int, int]] = []
         changed_items: list[tuple[int, int]] = []
-        for idx, angle in enumerate(angles):
+        for idx, angle in enumerate(filtered_angles_deg):
             sid = SERVO_ID_MIN + idx
             if need_full_sync and (not self.last_sent_valid[idx]):
                 unsynced_items.append((sid, angle))
@@ -416,14 +431,21 @@ class RaspiWsBridge:
             self.last_send_throttle_log = now
             logging.warning("发送限流生效, 本周期发送=%d, 待发送=%d", len(send_items), len(delta_items) - len(send_items))
 
-        send_positions = [
-            (sid, clamp_int(int(pos), SEND_MIN_DEG, SEND_MAX_DEG)) for sid, pos in send_items
-        ]
+        send_positions = [(sid, clamp_int(int(pos), SEND_MIN_DEG, SEND_MAX_DEG)) for sid, pos in send_items]
         send_mode = "full_sync" if need_full_sync else "delta"
-        for log_line in build_servo_send_log_lines(
+        send_traces = [
+            (
+                sid,
+                frame_angles_deg[sid - SERVO_ID_MIN],
+                reversed_angles_deg[sid - SERVO_ID_MIN],
+                pos,
+            )
+            for sid, pos in send_positions
+        ]
+        for log_line in build_servo_send_trace_log_lines(
             latest_seq,
             latest_uptime_ms,
-            send_positions,
+            send_traces,
             send_mode=send_mode,
         ):
             logging.info("%s", log_line)
@@ -485,25 +507,37 @@ def format_signed_angle_deg(angle_deg: int) -> str:
     return str(angle_deg)
 
 
-def build_servo_send_log_lines(
+def format_signed_angle_deg_float(angle_deg: float) -> str:
+    if angle_deg > 0:
+        return f"+{angle_deg:.1f}"
+    return f"{angle_deg:.1f}"
+
+
+def build_servo_send_trace_log_lines(
     seq: int,
     uptime_ms: int,
-    send_items: list[tuple[int, int]],
+    send_traces: list[tuple[int, float, float, int]],
     *,
     send_mode: str,
-    chunk_size: int = 8,
+    chunk_size: int = 4,
 ) -> list[str]:
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
-    if not send_items:
+    if not send_traces:
         return []
 
-    total_chunks = (len(send_items) + chunk_size - 1) // chunk_size
+    total_chunks = (len(send_traces) + chunk_size - 1) // chunk_size
     log_lines: list[str] = []
-    for chunk_index, start in enumerate(range(0, len(send_items), chunk_size), start=1):
-        chunk = send_items[start : start + chunk_size]
+    for chunk_index, start in enumerate(range(0, len(send_traces), chunk_size), start=1):
+        chunk = send_traces[start : start + chunk_size]
         chunk_text = " ".join(
-            f"{servo_id}:{format_signed_angle_deg(angle_deg)}" for servo_id, angle_deg in chunk
+            (
+                f"{servo_id}:"
+                f"frame={format_signed_angle_deg_float(frame_angle_deg)}"
+                f" rev={format_signed_angle_deg_float(reversed_angle_deg)}"
+                f" sent={format_signed_angle_deg(sent_angle_deg)}"
+            )
+            for servo_id, frame_angle_deg, reversed_angle_deg, sent_angle_deg in chunk
         )
         log_lines.append(
             "发送舵机角度: "
