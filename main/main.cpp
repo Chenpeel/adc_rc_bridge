@@ -214,11 +214,10 @@ static inline bool map_circle_angle_to_send_deg(int adc_phase_code, float *out_s
 
 static bool copy_latest_i2c_frame(uint8_t *out_frame, size_t out_capacity, size_t *out_len)
 {
-  // 复制“最近一次采样生成的完整 I2C 帧”。
-  // 这里锁的时间非常短：只做固定 48 字节 memcpy，避免阻塞采样任务或 I2C 发送任务太久。
+  // 锁时间短：固定 48 字节 memcpy，避免阻塞采样任务或 I2C 发送任务太久。
   if (!out_frame || out_capacity < BRIDGE_FRAME_SIZE || !out_len || !s_i2c_frame_mutex)
     return false;
-  // 这是主机 read 的关键路径。若这里拿锁失败，本次事务就可能读到空数据。
+  // 主机 read 的关键路径。若这里拿锁失败，本次事务就可能读到空数据。
   // 由于发布路径只做 48 字节 memcpy，临界区极短，因此这里直接等待锁最稳妥。
   if (xSemaphoreTake(s_i2c_frame_mutex, portMAX_DELAY) != pdTRUE)
   {

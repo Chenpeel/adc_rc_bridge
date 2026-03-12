@@ -77,6 +77,22 @@ class TestServoReverseMap(unittest.TestCase):
         self.assertAlmostEqual(send_angles[2], 36.6)
         self.assertAlmostEqual(send_angles[3], -1.5)
 
+    def test_build_servo_send_log_lines(self) -> None:
+        log_lines = bridge.build_servo_send_log_lines(
+            101,
+            123556,
+            [(21, -18), (22, 0), (23, 13), (24, 90)],
+            send_mode="delta",
+            chunk_size=2,
+        )
+        self.assertEqual(
+            log_lines,
+            [
+                "发送舵机角度: mode=delta seq=101 uptime_ms=123556 chunk=1/2 21:-18 22:0",
+                "发送舵机角度: mode=delta seq=101 uptime_ms=123556 chunk=2/2 23:+13 24:+90",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

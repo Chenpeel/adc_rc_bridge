@@ -377,6 +377,8 @@ class RaspiWsBridge:
             target_id = self.ws_target_id
             angles = self.latest_angles[:] if self.latest_angles else None
             need_full_sync = self.need_full_sync
+            latest_seq = self.latest_seq
+            latest_uptime_ms = self.latest_uptime_ms
 
         if not target_id:
             if now - self.last_wait_bind_log >= 3.0:
@@ -414,6 +416,18 @@ class RaspiWsBridge:
             self.last_send_throttle_log = now
             logging.warning("发送限流生效, 本周期发送=%d, 待发送=%d", len(send_items), len(delta_items) - len(send_items))
 
+        send_positions = [
+            (sid, clamp_int(int(pos), SEND_MIN_DEG, SEND_MAX_DEG)) for sid, pos in send_items
+        ]
+        send_mode = "full_sync" if need_full_sync else "delta"
+        for log_line in build_servo_send_log_lines(
+            latest_seq,
+            latest_uptime_ms,
+            send_positions,
+            send_mode=send_mode,
+        ):
+            logging.info("%s", log_line)
+
         speed = clamp_int(int(self.cfg.ws_servo_speed), 0, 1000)
         content = json.dumps(
             [
@@ -422,11 +436,11 @@ class RaspiWsBridge:
                     "web_servo": {
                         "is_bus_servo": bool(self.cfg.ws_is_bus_servo),
                         "servo_id": sid,
-                        "position": clamp_int(int(pos), SEND_MIN_DEG, SEND_MAX_DEG),
+                        "position": pos,
                         "speed": speed,
                     },
                 }
-                for sid, pos in send_items
+                for sid, pos in send_positions
             ],
             separators=(",", ":"),
             ensure_ascii=False,
@@ -435,7 +449,7 @@ class RaspiWsBridge:
         await self.ws_send_json(ws, payload)
 
         async with self.state_lock:
-            for sid, pos in send_items:
+            for sid, pos in send_positions:
                 idx = sid - SERVO_ID_MIN
                 if 0 <= idx < SERVO_COUNT:
                     self.last_sent_angles[idx] = pos
@@ -463,6 +477,40 @@ def clamp_float(v: float, lo: float, hi: float) -> float:
     if v > hi:
         return hi
     return v
+
+
+def format_signed_angle_deg(angle_deg: int) -> str:
+    if angle_deg > 0:
+        return f"+{angle_deg}"
+    return str(angle_deg)
+
+
+def build_servo_send_log_lines(
+    seq: int,
+    uptime_ms: int,
+    send_items: list[tuple[int, int]],
+    *,
+    send_mode: str,
+    chunk_size: int = 8,
+) -> list[str]:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if not send_items:
+        return []
+
+    total_chunks = (len(send_items) + chunk_size - 1) // chunk_size
+    log_lines: list[str] = []
+    for chunk_index, start in enumerate(range(0, len(send_items), chunk_size), start=1):
+        chunk = send_items[start : start + chunk_size]
+        chunk_text = " ".join(
+            f"{servo_id}:{format_signed_angle_deg(angle_deg)}" for servo_id, angle_deg in chunk
+        )
+        log_lines.append(
+            "发送舵机角度: "
+            f"mode={send_mode} seq={seq} uptime_ms={uptime_ms} "
+            f"chunk={chunk_index}/{total_chunks} {chunk_text}"
+        )
+    return log_lines
 
 
 def crc16_ccitt_false(data: bytes) -> int:
