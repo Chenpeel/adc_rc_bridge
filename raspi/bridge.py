@@ -26,6 +26,8 @@ SERVO_ID_MAX = 37
 SERVO_COUNT = SERVO_ID_MAX - SERVO_ID_MIN + 1
 SEND_MIN_DEG = -90
 SEND_MAX_DEG = 90
+FILTER_FAST_TRACK_MIN_DELTA_DEG = 12
+FILTER_FAST_TRACK_MAX_STEP_DEG = 24
 
 FRAME_MAGIC = b"\xAA\x55"
 FRAME_VERSION = 2
@@ -95,7 +97,21 @@ class ServoOutputFilter:
             self.inited[idx] = True
             return out
 
-        self.filtered[idx] += self.alpha * (raw_angle - self.filtered[idx])
+        # 大幅真实变化时，不再让 EMA 和小步进把输出长时间拖在旧值附近。
+        # 这样可以显著减小日志里 rev 与 sent 的长期偏差，同时仍保留小抖动抑制。
+        raw_delta = raw_angle - float(self.stable[idx])
+        fast_track_trigger_deg = max(
+            FILTER_FAST_TRACK_MIN_DELTA_DEG,
+            self.deadzone * 3,
+            self.max_step * 4,
+        )
+        fast_track_enabled = abs(raw_delta) >= float(fast_track_trigger_deg)
+
+        if fast_track_enabled:
+            self.filtered[idx] = raw_angle
+        else:
+            self.filtered[idx] += self.alpha * (raw_angle - self.filtered[idx])
+
         candidate = clamp_int(int(round(self.filtered[idx])), self.min_value, self.max_value)
         delta = candidate - self.stable[idx]
         abs_delta = abs(delta)
@@ -106,7 +122,11 @@ class ServoOutputFilter:
             return self.stable[idx]
 
         # 小幅变化要求连续多帧同向确认，降低ADC毛刺导致的舵机抖动
-        if self.confirm_frames > 1 and abs_delta < self.deadzone * 3:
+        if (
+            not fast_track_enabled
+            and self.confirm_frames > 1
+            and abs_delta < max(self.deadzone * 3, self.max_step * 4)
+        ):
             direction = 1 if delta > 0 else -1
             if self.pending_dir[idx] == direction:
                 self.pending_count[idx] += 1
@@ -120,10 +140,14 @@ class ServoOutputFilter:
             self.pending_dir[idx] = 0
             self.pending_count[idx] = 0
 
-        if delta > self.max_step:
-            delta = self.max_step
-        elif delta < -self.max_step:
-            delta = -self.max_step
+        effective_max_step = self.max_step
+        if fast_track_enabled:
+            effective_max_step = max(self.max_step, FILTER_FAST_TRACK_MAX_STEP_DEG)
+
+        if delta > effective_max_step:
+            delta = effective_max_step
+        elif delta < -effective_max_step:
+            delta = -effective_max_step
 
         self.stable[idx] = clamp_int(self.stable[idx] + delta, self.min_value, self.max_value)
         return self.stable[idx]
@@ -734,6 +758,8 @@ def load_config(path: Optional[str]) -> BridgeConfig:
                 setattr(cfg, k, parse_servo_reverse_map(v))
             else:
                 setattr(cfg, k, v)
+        else:
+            logging.warning("忽略未知配置项: %s", k)
     return cfg
 
 

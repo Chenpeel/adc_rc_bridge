@@ -63,6 +63,18 @@ class TestServoReverseMap(unittest.TestCase):
             cfg = bridge.load_config(path)
             self.assertEqual(cfg.servo_reverse_map, {21: True, 22: False})
 
+    def test_load_config_warns_unknown_key(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "config.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"i2c_request_gap_ms": 5, "i2c_bus": 1}, f)
+
+            with self.assertLogs(level="WARNING") as captured:
+                cfg = bridge.load_config(path)
+
+            self.assertEqual(cfg.i2c_bus, 1)
+            self.assertTrue(any("忽略未知配置项: i2c_request_gap_ms" in msg for msg in captured.output))
+
     def test_parse_adc_frame(self) -> None:
         frame = build_test_frame(101, 123556, [84.8, 40.0, 36.6, -1.5])
         parsed = bridge.parse_adc_frame(frame)
@@ -105,6 +117,23 @@ class TestServoReverseMap(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_servo_output_filter_fast_tracks_large_delta(self) -> None:
+        output_filter = bridge.ServoOutputFilter(
+            alpha=0.16,
+            deadzone=0,
+            max_step=4,
+            confirm_frames=2,
+            min_value=bridge.SEND_MIN_DEG,
+            max_value=bridge.SEND_MAX_DEG,
+            count=1,
+        )
+
+        outputs = [
+            output_filter.apply(0, raw_angle)
+            for raw_angle in (-31.5, 0.6, 23.7, 46.4, 56.9)
+        ]
+        self.assertEqual(outputs, [-32, -8, 16, 40, 57])
 
 
 if __name__ == "__main__":
