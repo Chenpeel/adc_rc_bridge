@@ -4,7 +4,7 @@
 
 > [!WARNING]
 > 由于 `ESP32` 的 Wi-Fi 模块稳定性较差，本项目已转用
-> [Raspi + ESP32](https://github.com/Chenpeel/adc_rc_bridge/tree/rpi-esp)
+> Raspi + ESP32
 > 模式。
 > 请优先参考该方案进行部署、烧录和调试，避免继续沿用当前纯
 > `ESP32` Wi-Fi 方案。
